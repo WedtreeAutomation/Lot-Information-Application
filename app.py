@@ -353,11 +353,34 @@ def render_header():
     )
 
 
+def set_authenticated(value: bool):
+    """Keep login state across page reloads by using the URL query string.
+    The single-user app only needs a lightweight persistence mechanism; this
+    avoids prompting again after a browser refresh while the user remains in the
+    same authenticated session."""
+    st.session_state.authenticated = value
+
+    try:
+        if value:
+            st.query_params["auth"] = "1"
+        elif "auth" in st.query_params:
+            del st.query_params["auth"]
+    except Exception:
+        pass
+
+
 def check_login() -> bool:
     """Gate the app behind a single username/password pair from secrets.
     Returns True once the current session is authenticated."""
     if st.session_state.get("authenticated"):
         return True
+
+    try:
+        if st.query_params.get("auth") == "1":
+            st.session_state.authenticated = True
+            return True
+    except Exception:
+        pass
 
     render_header()
 
@@ -378,7 +401,7 @@ def check_login() -> bool:
 
         if submitted:
             if username == APP_USERNAME and password == APP_PASSWORD:
-                st.session_state.authenticated = True
+                set_authenticated(True)
                 st.rerun()
             else:
                 st.error("Incorrect username or password.")
@@ -647,8 +670,8 @@ def render_filters(df) -> dict:
         vendor = st.multiselect("Vendor", sorted(df["vendor"].dropna().unique()))
         location = st.multiselect("Location", sorted(df["location"].dropna().unique()))
 
-        search = st.text_input("Search (product name / SKU)", placeholder="e.g. Kanjivaram Silk Saree")
-        lot_number = st.text_input("Lot number", placeholder="e.g. L2024-045")
+        search = st.text_input("Product/SKU)")
+        lot_number = st.text_input("Lot number")
 
         in_stock_only = st.checkbox("In stock only", value=False)
 
@@ -669,7 +692,7 @@ def render_filters(df) -> dict:
             st.rerun()
 
         if st.button("🚪 Logout", width="stretch"):
-            st.session_state.authenticated = False
+            set_authenticated(False)
             st.rerun()
 
     return {
