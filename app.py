@@ -7,6 +7,7 @@ if sys.platform.startswith("win"):
 import base64
 import html as html_lib
 from io import BytesIO
+from datetime import date
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
 
@@ -38,6 +39,11 @@ APP_SUBTITLE = secret("APP_SUBTITLE", "PRODUCT GALLERY")
 PAGE_ICON = secret("APP_ICON", "🧵")
 
 st.set_page_config(page_title=APP_TITLE, page_icon=PAGE_ICON, layout="wide")
+
+# --- Login credentials (single user) - set in secrets.toml / Streamlit Cloud Secrets ---
+APP_USERNAME = secret("APP_USERNAME")
+APP_PASSWORD = secret("APP_PASSWORD")
+LOGIN_CONFIGURED = bool(APP_USERNAME and APP_PASSWORD)
 
 PAGE_SIZE = 12
 DEBUG = False
@@ -132,13 +138,14 @@ def inject_theme():
         }
 
         /* Filter panel card */
-        .filter-panel {
+        .st-key-filter_panel {
             background: #FDF4F6;
-            border: 1px solid #F0DCE1;
+            border: 1.5px solid #E3AEBC;
             border-radius: 14px;
-            padding: 18px 18px 6px 18px;
+            padding: 18px 18px 12px 18px;
+            box-shadow: 0 3px 14px rgba(158,79,104,0.10);
         }
-        .filter-panel h3 {
+        .st-key-filter_panel h3 {
             font-family: 'Playfair Display', serif;
             color: #9E4F68;
             font-size: 18px;
@@ -256,6 +263,78 @@ def inject_theme():
             color: #9E4F68;
             padding-top: 8px;
         }
+
+        /* Login card */
+        .st-key-login_card {
+            max-width: 380px;
+            margin: 48px auto 0 auto;
+            background: #ffffff;
+            border: 1.5px solid #E3AEBC;
+            border-radius: 16px;
+            padding: 32px 28px 24px 28px;
+            box-shadow: 0 6px 24px rgba(158,79,104,0.12);
+        }
+        .st-key-login_card h3 {
+            font-family: 'Playfair Display', serif;
+            color: #9E4F68;
+            text-align: center;
+            margin-top: 0;
+            margin-bottom: 18px;
+        }
+
+        /* Hide the default Streamlit top toolbar (Deploy button, menu) for a cleaner branded header */
+        [data-testid="stHeader"] { display: none; }
+        [data-testid="stToolbar"] { display: none; }
+        .block-container { padding-top: 1.5rem; }
+
+        /* Text inputs / number inputs - border on the actual <input> element
+           itself, since Streamlit's wrapper div class names vary by
+           version and weren't reliably matching here. */
+        [data-testid="stTextInput"] input,
+        [data-testid="stNumberInput"] input,
+        [data-testid="stTextArea"] textarea {
+            border: 1.5px solid #E3AEBC !important;
+            border-radius: 8px !important;
+            background-color: #ffffff !important;
+            padding: 8px 12px !important;
+        }
+        [data-testid="stTextInput"] input:focus,
+        [data-testid="stNumberInput"] input:focus,
+        [data-testid="stTextArea"] textarea:focus {
+            border-color: #B5637A !important;
+            box-shadow: 0 0 0 1px #B5637A !important;
+        }
+        [data-testid="stTextInput"] input::placeholder,
+        [data-testid="stTextArea"] textarea::placeholder {
+            color: #C9A3AF !important;
+            opacity: 1 !important;
+        }
+        /* Some Streamlit versions also render a bordered wrapper div around
+           the input - keep it transparent so it doesn't double up or clash. */
+        div[data-baseweb="base-input"],
+        div[data-baseweb="input"] {
+            border: none !important;
+            background-color: transparent !important;
+        }
+
+        /* Select / multiselect boxes - same treatment */
+        div[data-baseweb="select"] > div {
+            border: 1.5px solid #E3AEBC !important;
+            border-radius: 8px !important;
+            background-color: #ffffff !important;
+        }
+        div[data-baseweb="select"]:focus-within > div {
+            border-color: #B5637A !important;
+        }
+
+        /* Branded spinner */
+        [data-testid="stSpinner"] > div > div {
+            border-top-color: #B5637A !important;
+        }
+        [data-testid="stSpinner"] p {
+            color: #9E4F68 !important;
+            font-weight: 600;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -272,6 +351,39 @@ def render_header():
         """,
         unsafe_allow_html=True,
     )
+
+
+def check_login() -> bool:
+    """Gate the app behind a single username/password pair from secrets.
+    Returns True once the current session is authenticated."""
+    if st.session_state.get("authenticated"):
+        return True
+
+    render_header()
+
+    if not LOGIN_CONFIGURED:
+        st.error(
+            "Login is not configured yet. Add **APP_USERNAME** and **APP_PASSWORD** "
+            "under App settings → Secrets (or `.streamlit/secrets.toml` locally) — "
+            "see `secrets.toml.example`."
+        )
+        return False
+
+    with st.container(key="login_card"):
+        st.markdown("<h3>Sign in</h3>", unsafe_allow_html=True)
+        with st.form("login_form", clear_on_submit=False):
+            username = st.text_input("Username", placeholder="Enter your username")
+            password = st.text_input("Password", type="password", placeholder="Enter your password")
+            submitted = st.form_submit_button("Login", width="stretch")
+
+        if submitted:
+            if username == APP_USERNAME and password == APP_PASSWORD:
+                st.session_state.authenticated = True
+                st.rerun()
+            else:
+                st.error("Incorrect username or password.")
+
+    return False
 
 
 # ===========================================================
@@ -365,16 +477,17 @@ def build_inventory_df() -> pd.DataFrame:
     product_product = _read_delta_lazy(
         lakehouse_id_silver, "Odoo", "product_product",
         columns=["id", "display_name", "categ_id_name", "tracking",
-                 "product_variant_id", "lst_price", "standard_price"],
+                 "product_variant_id", "sku", "lst_price", "standard_price"],
     ).rename({
         "id": "product_id",
         "display_name": "product_name",
         "categ_id_name": "category",
         "lst_price": "sp",
         "standard_price": "cp",
-    }).with_columns(
-        pl.col("product_id").cast(pl.Utf8)
-    )
+    }).with_columns([
+        pl.col("product_id").cast(pl.Utf8),
+        pl.col("sku").cast(pl.Utf8),
+    ])
 
     # --- product_template (pt) ---
     # .unique() guards against join-explosion: if this "lookup" table has
@@ -394,45 +507,88 @@ def build_inventory_df() -> pd.DataFrame:
     )
 
     # --- stock_quant_n1 (sq) ---
+    # NOTE: product_id here is the internal join key to product_base, not
+    # the SKU - the real sku now comes from product_product.sku (p.sku).
     stock_quant = _read_delta_lazy(
         lakehouse_id_silver, "Odoo", "stock_quant_n1",
         columns=["company_id_name", "product_id", "lot_id_name",
                  "location_id_name", "quantity"],
     ).rename({
-        "product_id": "sku",
         "lot_id_name": "lot_number",
         "location_id_name": "location",
         "quantity": "available_inventory",
-    }).with_columns(
-        pl.col("company_id_name").replace(COMPANY_LABELS).alias("company")
-    )
+    }).with_columns([
+        pl.col("product_id").cast(pl.Utf8),
+        pl.col("company_id_name").replace(COMPANY_LABELS).alias("company"),
+    ])
 
     inventory = stock_quant.join(
-        product_base, left_on="sku", right_on="product_id", how="left"
+        product_base, on="product_id", how="left"
     ).with_columns(
         (pl.col("available_inventory") * pl.col("sp")).alias("available_selling_price")
     )
 
+    # --- stock_min_date (first stock movement date, for "overall age") ---
+    stock_min_date = _read_delta_lazy(
+        lakehouse_id_silver, "Odoo", "stock_move_line",
+        columns=["product_id", "lot_id_name", "date",
+                 "company_id_name", "location_id_name"],
+    ).filter(
+        (pl.col("company_id_name") == "Wedtree eStore Private Limited - HO")
+        & (pl.col("location_id_name") == "Partners/Vendors")
+    ).with_columns([
+        pl.col("product_id").cast(pl.Utf8),
+        # strict=False: rows with an unparseable/blank date become null
+        # instead of failing the whole query.
+        pl.col("date").cast(pl.Date, strict=False),
+    ]).rename({
+        "lot_id_name": "lot_number",
+    }).group_by(["product_id", "lot_number"]).agg(
+        pl.col("date").min().alias("stock_move_date")
+    )
+
+    inventory = inventory.join(
+        stock_min_date, on=["product_id", "lot_number"], how="left"
+    ).with_columns(
+        (pl.lit(date.today()) - pl.col("stock_move_date"))
+        .dt.total_days()
+        .alias("overall_age")
+    )
+
     # --- product_images (pi, Bronze) ---
     # Same reasoning: dedupe on product_id so this join can't multiply rows.
+    # --- product_images (pi, Bronze) ---
+    # A single product_id can have multiple rows here, some with a real
+    # image path and some blank/null (e.g. placeholder rows). Filtering
+    # to valid images FIRST, then deduping, guarantees that if any valid
+    # image exists for a product it's the one kept - doing it in the
+    # opposite order risks .unique(keep="first") locking in a blank row
+    # before the real image ever gets a chance to survive.
     product_images = _read_delta_lazy(
         lakehouse_id_bronze, "Odoo", "product_images",
         columns=["product_id", "image_1920"],
     ).with_columns(
         pl.col("product_id").cast(pl.Utf8)
+    ).filter(
+        pl.col("image_1920").is_not_null()
+        & (pl.col("image_1920") != "")
+        & (pl.col("image_1920") != "False")
     ).unique(subset=["product_id"], keep="first")
 
     # Inner join: only keep products that actually have a matching row in
     # product_images (drops products with no image reference at all).
+    # IMPORTANT: product_images is keyed by the internal product_id
+    # (Odoo's product.product id), not by the display sku - so we join on
+    # product_id here even though sku is now a separate, human-readable field.
     final = inventory.join(
-        product_images, left_on="sku", right_on="product_id",
+        product_images, on="product_id",
         how="inner", suffix="_img",
     )
 
     final = final.select([
         "company", "category", "vendor", "sku", "lot_number", "location",
         "product_name", "cp", "sp", "available_inventory",
-        "available_selling_price", "image_1920",
+        "available_selling_price", "product_id", "overall_age", "image_1920",
     ]).filter(
         # Belt-and-braces: also drop rows where image_1920 itself is
         # null/empty, or the literal string "False" that Odoo sometimes
@@ -483,36 +639,38 @@ def apply_filters(df, f):
 
 
 def render_filters(df) -> dict:
-    st.markdown('<div class="filter-panel">', unsafe_allow_html=True)
-    st.markdown("<h3>Filters</h3>", unsafe_allow_html=True)
+    with st.container(key="filter_panel"):
+        st.markdown("<h3>Filters</h3>", unsafe_allow_html=True)
 
-    company = st.multiselect("Company", sorted(df["company"].dropna().unique()))
-    category = st.multiselect("Category", sorted(df["category"].dropna().unique()))
-    vendor = st.multiselect("Vendor", sorted(df["vendor"].dropna().unique()))
-    location = st.multiselect("Location", sorted(df["location"].dropna().unique()))
+        company = st.multiselect("Company", sorted(df["company"].dropna().unique()))
+        category = st.multiselect("Category", sorted(df["category"].dropna().unique()))
+        vendor = st.multiselect("Vendor", sorted(df["vendor"].dropna().unique()))
+        location = st.multiselect("Location", sorted(df["location"].dropna().unique()))
 
-    search = st.text_input("Search (product name / SKU)")
-    lot_number = st.text_input("Lot number contains")
+        search = st.text_input("Search (product name / SKU)", placeholder="e.g. Kanjivaram Silk Saree")
+        lot_number = st.text_input("Lot number", placeholder="e.g. L2024-045")
 
-    in_stock_only = st.checkbox("In stock only", value=False)
+        in_stock_only = st.checkbox("In stock only", value=False)
 
-    sp_series = df["sp"].dropna()
-    price_range = None
-    if not sp_series.empty:
-        lo, hi = float(sp_series.min()), float(sp_series.max())
-        if lo < hi:
-            price_range = st.slider("Selling price range", lo, hi, (lo, hi))
+        sp_series = df["sp"].dropna()
+        price_range = None
+        # if not sp_series.empty:
+        #     lo, hi = float(sp_series.min()), float(sp_series.max())
+        #     if lo < hi:
+        #         price_range = st.slider("Selling price range", lo, hi, (lo, hi))
 
-    cols_per_row = st.slider("Columns per row", min_value=2, max_value=6, value=4)
+        cols_per_row = st.slider("Columns per row", min_value=2, max_value=6, value=4)
 
-    st.markdown("<br>", unsafe_allow_html=True)
-    if st.button("🔄 Refresh data now", width="stretch"):
-        build_inventory_df.clear()
-        load_image_cached.clear()
-        st.session_state.page = 1
-        st.rerun()
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("🔄 Refresh data now", width="stretch"):
+            build_inventory_df.clear()
+            load_image_cached.clear()
+            st.session_state.page = 1
+            st.rerun()
 
-    st.markdown("</div>", unsafe_allow_html=True)
+        if st.button("🚪 Logout", width="stretch"):
+            st.session_state.authenticated = False
+            st.rerun()
 
     return {
         "company": company,
@@ -573,6 +731,7 @@ def render_card_html(item, img) -> str:
             <div class="product-card-row"><span>SKU</span><span>{_fmt(item.get('sku'))}</span></div>
             <div class="product-card-row"><span>Lot No.</span><span>{_fmt(item.get('lot_number'))}</span></div>
             <div class="product-card-row"><span>Location</span><span>{_fmt(item.get('location'))}</span></div>
+            <div class="product-card-row"><span>Age (days)</span><span>{_fmt(item.get('overall_age'))}</span></div>
             <div class="product-card-row"><span>Stock value</span><span>{_fmt_money(item.get('available_selling_price'))}</span></div>
             <div class="product-card-footer">
                 <div class="price-block">
@@ -591,6 +750,10 @@ def render_card_html(item, img) -> str:
 # ===========================================================
 def main():
     inject_theme()
+
+    if not check_login():
+        return
+
     render_header()
 
     if MISSING_CONFIG:
@@ -602,7 +765,8 @@ def main():
         return
 
     try:
-        full_df = build_inventory_df()
+        with st.spinner("Loading your product gallery..."):
+            full_df = build_inventory_df()
     except Exception as e:
         st.error(f"Failed to connect / fetch data: {e}")
         return
@@ -630,7 +794,8 @@ def main():
 
         client = get_datalake_service_client()
         refs = page_df["image_1920"].tolist()
-        results = load_images_parallel(client, refs) if refs else []
+        with st.spinner("Loading images..."):
+            results = load_images_parallel(client, refs) if refs else []
         image_lookup = dict(zip(refs, results))
 
         cols_per_row = filters["cols_per_row"]
