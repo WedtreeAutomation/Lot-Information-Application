@@ -986,25 +986,50 @@ def compute_filter_options(df: pd.DataFrame) -> dict:
 
 
 def render_filters(df, options: dict, panel_key: str = "filter_panel") -> dict:
+    filter_state = st.session_state.setdefault("filter_state", {
+        "company": [],
+        "category": [],
+        "vendor": [],
+        "location": [],
+        "search": "",
+        "lot_number": "",
+        "in_stock_only": False,
+        "cols_per_row": 4,
+    })
+
     with st.container(key=panel_key):
         if panel_key == "mobile_filter_panel":
-            # The open drawer carries its own close button, laid out
-            # inline with the heading (normal document flow) rather
-            # than a separate floating icon - so it's always exactly
-            # where it visually belongs, with no overlap risk.
-            head_col, close_col = st.columns([5, 1])
-            with head_col:
-                st.markdown("<h3>Filters</h3>", unsafe_allow_html=True)
-            with close_col:
-                if st.button("✕", key=f"{panel_key}_close", help="Close filters"):
-                    st.session_state.mobile_filters_open = False
-                    st.rerun()
+            # Close the drawer without wiping the already-selected filters.
+            if st.button("Close filters", key="mobile_filter_close", use_container_width=True):
+                st.session_state.mobile_filters_open = False
+                st.rerun()
+            st.markdown("<h3>Filters</h3>", unsafe_allow_html=True)
         else:
             st.markdown("<h3>Filters</h3>", unsafe_allow_html=True)
 
-        company = st.multiselect("Company", options["company"], key=f"{panel_key}_company")
-        category = st.multiselect("Category", options["category"], key=f"{panel_key}_category")
-        vendor = st.multiselect("Vendor", options["vendor"], key=f"{panel_key}_vendor")
+        company = st.multiselect(
+            "Company",
+            options["company"],
+            default=filter_state.get("company", []),
+            key="filters_company",
+        )
+        filter_state["company"] = company
+
+        category = st.multiselect(
+            "Category",
+            options["category"],
+            default=filter_state.get("category", []),
+            key="filters_category",
+        )
+        filter_state["category"] = category
+
+        vendor = st.multiselect(
+            "Vendor",
+            options["vendor"],
+            default=filter_state.get("vendor", []),
+            key="filters_vendor",
+        )
+        filter_state["vendor"] = vendor
 
         if company:
             location_options = [
@@ -1015,15 +1040,36 @@ def render_filters(df, options: dict, panel_key: str = "filter_panel") -> dict:
             ]
         else:
             location_options = options["location"]
-        location = st.multiselect("Location", location_options, key=f"{panel_key}_location")
+        location = st.multiselect(
+            "Location",
+            location_options,
+            default=filter_state.get("location", []),
+            key="filters_location",
+        )
+        filter_state["location"] = location
 
-        search = st.text_input("Product/SKU", key=f"{panel_key}_search")
-        lot_number = st.text_input("Lot Number", key=f"{panel_key}_lot")
+        search = st.text_input("Product/SKU", value=filter_state.get("search", ""), key="filters_search")
+        filter_state["search"] = search
 
-        in_stock_only = st.checkbox("In stock only", value=False, key=f"{panel_key}_stock")
+        lot_number = st.text_input("Lot Number", value=filter_state.get("lot_number", ""), key="filters_lot")
+        filter_state["lot_number"] = lot_number
+
+        in_stock_only = st.checkbox(
+            "In stock only",
+            value=filter_state.get("in_stock_only", False),
+            key="filters_stock",
+        )
+        filter_state["in_stock_only"] = in_stock_only
         price_range = None
 
-        cols_per_row = st.slider("Columns per row", min_value=2, max_value=6, value=4, key=f"{panel_key}_cols")
+        cols_per_row = st.slider(
+            "Columns per row",
+            min_value=2,
+            max_value=6,
+            value=filter_state.get("cols_per_row", 4),
+            key="filters_cols",
+        )
+        filter_state["cols_per_row"] = cols_per_row
 
         st.markdown("<br>", unsafe_allow_html=True)
         if st.button("🔄 Refresh data now", key=f"{panel_key}_refresh", width="stretch"):
@@ -1154,73 +1200,128 @@ def main():
             st.session_state.mobile_filters_open = True
             st.rerun()
 
-    # Desktop: left pane (filters) / right pane (results).
-    filter_col, results_col = st.columns([1, 3])
-
+    # Render exactly one filter layout at a time to keep the widget state
+    # consistent and ensure the selected filters are applied once.
     filter_options = compute_filter_options(full_df)
-
-    with filter_col:
-        filters = render_filters(full_df, filter_options, "filter_panel")
 
     if st.session_state.mobile_filters_open:
         filters = render_filters(full_df, filter_options, "mobile_filter_panel")
+        with st.container():
+            df = apply_filters(full_df, filters)
+            total = len(df)
+            total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
 
-    with results_col:
-        df = apply_filters(full_df, filters)  # empty filters => full_df, unchanged
-        total = len(df)
-        total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+            if "page" not in st.session_state:
+                st.session_state.page = 1
+            st.session_state.page = min(max(1, st.session_state.page), total_pages)
 
-        if "page" not in st.session_state:
-            st.session_state.page = 1
-        st.session_state.page = min(max(1, st.session_state.page), total_pages)
+            start = (st.session_state.page - 1) * PAGE_SIZE
+            end = start + PAGE_SIZE
+            page_df = df.iloc[start:end]
 
-        start = (st.session_state.page - 1) * PAGE_SIZE
-        end = start + PAGE_SIZE
-        page_df = df.iloc[start:end]
+            client = get_datalake_service_client()
+            refs = page_df["image_1920"].tolist()
+            with st.spinner("Loading images..."):
+                results = load_images_parallel(client, refs) if refs else []
+            image_lookup = dict(zip(refs, results))
 
-        client = get_datalake_service_client()
-        refs = page_df["image_1920"].tolist()
-        with st.spinner("Loading images..."):
-            results = load_images_parallel(client, refs) if refs else []
-        image_lookup = dict(zip(refs, results))
+            cols_per_row = filters["cols_per_row"]
 
-        cols_per_row = filters["cols_per_row"]
-
-        st.markdown(
-            f"<div style='color: var(--muted-text); font-size:13px; margin-bottom:8px;'>"
-            f"{total} product{'s' if total != 1 else ''} found</div>",
-            unsafe_allow_html=True,
-        )
-
-        if total == 0:
-            st.info("No products match the current filters.")
-        else:
-            for row_start in range(0, len(page_df), cols_per_row):
-                row_items = page_df.iloc[row_start:row_start + cols_per_row]
-                cols = st.columns(cols_per_row)
-                for col, (_, item) in zip(cols, row_items.iterrows()):
-                    with col:
-                        img, raw, err = image_lookup.get(item["image_1920"], (None, None, "No image reference"))
-                        if DEBUG:
-                            st.caption(str(item["image_1920"]))
-                        st.markdown(render_card_html(item, img), unsafe_allow_html=True)
-
-        st.divider()
-        c1, c2, c3 = st.columns([1, 2, 1])
-        with c1:
-            if st.button("⬅ Previous", disabled=st.session_state.page <= 1):
-                st.session_state.page -= 1
-                st.rerun()
-        with c2:
             st.markdown(
-                f"<div class='page-indicator'>Page {st.session_state.page} of {total_pages} "
-                f"({total} products)</div>",
+                f"<div style='color: var(--muted-text); font-size:13px; margin-bottom:8px;'>"
+                f"{total} product{'s' if total != 1 else ''} found</div>",
                 unsafe_allow_html=True,
             )
-        with c3:
-            if st.button("Next ➡", disabled=st.session_state.page >= total_pages):
-                st.session_state.page += 1
-                st.rerun()
+
+            if total == 0:
+                st.info("No products match the current filters.")
+            else:
+                for row_start in range(0, len(page_df), cols_per_row):
+                    row_items = page_df.iloc[row_start:row_start + cols_per_row]
+                    cols = st.columns(cols_per_row)
+                    for col, (_, item) in zip(cols, row_items.iterrows()):
+                        with col:
+                            img, raw, err = image_lookup.get(item["image_1920"], (None, None, "No image reference"))
+                            if DEBUG:
+                                st.caption(str(item["image_1920"]))
+                            st.markdown(render_card_html(item, img), unsafe_allow_html=True)
+
+            st.divider()
+            c1, c2, c3 = st.columns([1, 2, 1])
+            with c1:
+                if st.button("⬅ Previous", disabled=st.session_state.page <= 1):
+                    st.session_state.page -= 1
+                    st.rerun()
+            with c2:
+                st.markdown(
+                    f"<div class='page-indicator'>Page {st.session_state.page} of {total_pages} "
+                    f"({total} products)</div>",
+                    unsafe_allow_html=True,
+                )
+            with c3:
+                if st.button("Next ➡", disabled=st.session_state.page >= total_pages):
+                    st.session_state.page += 1
+                    st.rerun()
+    else:
+        filter_col, results_col = st.columns([1, 3])
+        with filter_col:
+            filters = render_filters(full_df, filter_options, "filter_panel")
+        with results_col:
+            df = apply_filters(full_df, filters)
+            total = len(df)
+            total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+
+            if "page" not in st.session_state:
+                st.session_state.page = 1
+            st.session_state.page = min(max(1, st.session_state.page), total_pages)
+
+            start = (st.session_state.page - 1) * PAGE_SIZE
+            end = start + PAGE_SIZE
+            page_df = df.iloc[start:end]
+
+            client = get_datalake_service_client()
+            refs = page_df["image_1920"].tolist()
+            with st.spinner("Loading images..."):
+                results = load_images_parallel(client, refs) if refs else []
+            image_lookup = dict(zip(refs, results))
+
+            cols_per_row = filters["cols_per_row"]
+
+            st.markdown(
+                f"<div style='color: var(--muted-text); font-size:13px; margin-bottom:8px;'>"
+                f"{total} product{'s' if total != 1 else ''} found</div>",
+                unsafe_allow_html=True,
+            )
+
+            if total == 0:
+                st.info("No products match the current filters.")
+            else:
+                for row_start in range(0, len(page_df), cols_per_row):
+                    row_items = page_df.iloc[row_start:row_start + cols_per_row]
+                    cols = st.columns(cols_per_row)
+                    for col, (_, item) in zip(cols, row_items.iterrows()):
+                        with col:
+                            img, raw, err = image_lookup.get(item["image_1920"], (None, None, "No image reference"))
+                            if DEBUG:
+                                st.caption(str(item["image_1920"]))
+                            st.markdown(render_card_html(item, img), unsafe_allow_html=True)
+
+            st.divider()
+            c1, c2, c3 = st.columns([1, 2, 1])
+            with c1:
+                if st.button("⬅ Previous", disabled=st.session_state.page <= 1):
+                    st.session_state.page -= 1
+                    st.rerun()
+            with c2:
+                st.markdown(
+                    f"<div class='page-indicator'>Page {st.session_state.page} of {total_pages} "
+                    f"({total} products)</div>",
+                    unsafe_allow_html=True,
+                )
+            with c3:
+                if st.button("Next ➡", disabled=st.session_state.page >= total_pages):
+                    st.session_state.page += 1
+                    st.rerun()
 
 
 if __name__ == "__main__":
