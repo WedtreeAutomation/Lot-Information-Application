@@ -955,15 +955,33 @@ def compute_filter_options(df: pd.DataFrame) -> dict:
     again for the mobile panel. Cached here and computed once per data
     refresh, then shared by both panels - that's what made opening the
     mobile filter drawer feel slow."""
+
+    excluded_companies = {"Saree Trails", "Wedtree eStore Private Limited - Online"}
+
+    company_values = [
+        value for value in sorted(df["company"].dropna().unique())
+        if value not in excluded_companies
+    ]
+    category_values = sorted({
+        value
+        for raw in df["category"].dropna().tolist()
+        for value in expand_category_hierarchy(raw)
+        if not str(value).strip().upper().startswith("ADMIN")
+    })
+
+    excluded_locations = {
+        "Physical Locations/Subcontracting Location",
+        "Virtual Locations/Production",
+    }
+
     return {
-        "company": sorted(df["company"].dropna().unique()),
-        "category": sorted({
-            value
-            for raw in df["category"].dropna().tolist()
-            for value in expand_category_hierarchy(raw)
-        }),
+        "company": company_values,
+        "category": category_values,
         "vendor": sorted(df["vendor"].dropna().unique()),
-        "location": sorted(df["location"].dropna().unique()),
+        "location": [
+            value for value in sorted(df["location"].dropna().unique())
+            if value not in excluded_locations
+        ],
     }
 
 
@@ -987,7 +1005,17 @@ def render_filters(df, options: dict, panel_key: str = "filter_panel") -> dict:
         company = st.multiselect("Company", options["company"], key=f"{panel_key}_company")
         category = st.multiselect("Category", options["category"], key=f"{panel_key}_category")
         vendor = st.multiselect("Vendor", options["vendor"], key=f"{panel_key}_vendor")
-        location = st.multiselect("Location", options["location"], key=f"{panel_key}_location")
+
+        if company:
+            location_options = [
+                value for value in sorted(
+                    df.loc[df["company"].isin(company), "location"].dropna().unique()
+                )
+                if value not in {"Physical Locations/Subcontracting Location", "Virtual Locations/Production"}
+            ]
+        else:
+            location_options = options["location"]
+        location = st.multiselect("Location", location_options, key=f"{panel_key}_location")
 
         search = st.text_input("Product/SKU", key=f"{panel_key}_search")
         lot_number = st.text_input("Lot Number", key=f"{panel_key}_lot")
