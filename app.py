@@ -52,7 +52,7 @@ MAX_WORKERS = 20
 # How long cached data/images stay valid before being refetched from
 # OneLake automatically. Lower this (e.g. 60 * 60 for hourly) if you
 # need fresher data; raise it to cut down on OneLake calls.
-DATA_TTL_SECONDS = 24 * 60 * 60  # 1 day
+DATA_TTL_SECONDS =  60 * 60  # 1 hr
 
 # ===========================================================
 # Fabric / OneLake connection details - read from Streamlit secrets.
@@ -418,6 +418,46 @@ def inject_theme():
         }}
         .st-key-mobile_filter_panel {{ display: none; }}
 
+        /* Top-right X close icon inline with the "Filters" heading in
+           the mobile drawer - the standard placement used by most
+           mobile apps for dismissing a slide-in panel, rather than a
+           separate full-width button floating above the heading. */
+        .st-key-mobile_filter_panel [data-testid="stHorizontalBlock"]:first-of-type {{
+            align-items: center;
+        }}
+        .st-key-mobile_filter_close_x button {{
+            width: 32px;
+            height: 32px;
+            min-width: 32px;
+            border-radius: 8px;
+            padding: 0;
+            font-size: 14px;
+            line-height: 1;
+            background: var(--soft-bg);
+            color: var(--panel-text);
+            box-shadow: none;
+            border: 1px solid var(--card-border);
+        }}
+        .st-key-mobile_filter_close_x button:hover {{
+            background: var(--card-border);
+            color: var(--panel-text);
+            box-shadow: none;
+            transform: none;
+        }}
+
+        /* Apply Filters is the primary action in the mobile drawer -
+           give it a solid brand-gradient fill so it visually outranks
+           the plain-pink default Logout button below it. */
+        .st-key-mobile_filter_apply button {{
+            background: linear-gradient(135deg, var(--brand-1) 0%, var(--brand-2) 55%, var(--brand-3) 100%);
+            font-weight: 700;
+            box-shadow: 0 4px 14px rgba(158,79,104,0.30);
+        }}
+        .st-key-mobile_filter_apply button:hover {{
+            filter: brightness(1.08);
+            box-shadow: 0 6px 18px rgba(158,79,104,0.4);
+        }}
+
         @media (max-width: 768px) {{
             .st-key-filter_panel {{ display: none !important; }}
             .st-key-mobile_filters_toggle {{ display: block; }}
@@ -444,24 +484,6 @@ def inject_theme():
                 margin-bottom: 10px;
             }}
             .st-key-mobile_filter_panel .stButton > button {{ margin-top: 8px; }}
-            /* Close (✕) button inline with "Filters" heading, in normal
-               flow inside the drawer itself - no fixed positioning, so
-               it's always exactly where the heading row puts it. */
-            .st-key-mobile_filter_panel [data-testid="stHorizontalBlock"]:first-of-type {{
-                align-items: center;
-            }}
-            .st-key-mobile_filter_panel [data-testid="stHorizontalBlock"]:first-of-type .stButton > button {{
-                width: 32px;
-                height: 32px;
-                min-width: 32px;
-                border-radius: 8px;
-                padding: 0;
-                font-size: 14px;
-                background: var(--soft-bg);
-                color: var(--panel-text);
-                margin-top: 0;
-                box-shadow: none;
-            }}
         }}
 
         [data-testid="stHeader"] {{ display: none; }}
@@ -999,11 +1021,17 @@ def render_filters(df, options: dict, panel_key: str = "filter_panel") -> dict:
 
     with st.container(key=panel_key):
         if panel_key == "mobile_filter_panel":
-            # Close the drawer without wiping the already-selected filters.
-            if st.button("Close filters", key="mobile_filter_close", use_container_width=True):
-                st.session_state.mobile_filters_open = False
-                st.rerun()
-            st.markdown("<h3>Filters</h3>", unsafe_allow_html=True)
+            # Top-right X, inline with the "Filters" heading - the
+            # standard placement for dismissing a slide-in panel in most
+            # mobile apps, rather than a separate full-width button
+            # floating above the heading.
+            head_col, close_col = st.columns([5, 1])
+            with head_col:
+                st.markdown("<h3>Filters</h3>", unsafe_allow_html=True)
+            with close_col:
+                if st.button("✕", key="mobile_filter_close_x", help="Close filters"):
+                    st.session_state.mobile_filters_open = False
+                    st.rerun()
         else:
             st.markdown("<h3>Filters</h3>", unsafe_allow_html=True)
 
@@ -1072,12 +1100,20 @@ def render_filters(df, options: dict, panel_key: str = "filter_panel") -> dict:
         filter_state["cols_per_row"] = cols_per_row
 
         st.markdown("<br>", unsafe_allow_html=True)
-        if st.button("🔄 Refresh data now", key=f"{panel_key}_refresh", width="stretch"):
-            build_inventory_df.clear()
-            load_image_cached.clear()
-            compute_filter_options.clear()
-            st.session_state.page = 1
-            st.rerun()
+
+        if panel_key == "mobile_filter_panel":
+            # "Apply Filters" - the explicit commit-and-close action a
+            # mobile filter drawer is expected to have, in the spot the
+            # old Refresh button used to occupy. Every filter widget
+            # above already writes into filter_state / session_state as
+            # soon as it's touched, so there's nothing extra to compute
+            # here - this button's job is purely to close the drawer and
+            # reveal the (already updated) results, which is what
+            # "Apply" means from the person's point of view. The X at
+            # the top is a plain dismiss for the same underlying state.
+            if st.button("✅ Apply Filters", key="mobile_filter_apply", width="stretch"):
+                st.session_state.mobile_filters_open = False
+                st.rerun()
 
         if st.button("🚪 Logout", key=f"{panel_key}_logout", width="stretch"):
             set_authenticated(False)
