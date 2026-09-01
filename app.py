@@ -100,241 +100,482 @@ def table_uri(lakehouse_id: str, schema: str, table: str) -> str:
     )
 
 
+def normalize_category_value(value) -> str:
+    if value is None or pd.isna(value):
+        return ""
+    text = str(value).strip()
+    text = text.replace(" / ", "/")
+    text = text.replace("/ ", "/").replace(" /", "/")
+    text = " / ".join(part.strip() for part in text.split("/") if part.strip())
+    return text
+
+
+def expand_category_hierarchy(raw_value):
+    cleaned = normalize_category_value(raw_value)
+    if not cleaned:
+        return []
+    parts = [part.strip() for part in cleaned.split("/") if part.strip()]
+    hierarchy = []
+    current = []
+    for part in parts:
+        current.append(part)
+        hierarchy.append(" / ".join(current))
+    return hierarchy
+
+
+def category_matches_selected(category_value, selected_values):
+    category_value = normalize_category_value(category_value)
+    if not category_value:
+        return False
+    for selected in selected_values:
+        selected_value = normalize_category_value(selected)
+        if not selected_value:
+            continue
+        if category_value == selected_value or category_value.startswith(selected_value + " / "):
+            return True
+    return False
+
+
 # ===========================================================
 # Branding / CSS
 # ===========================================================
 def inject_theme():
+    theme_css = """
+    :root {
+        --bg-color: #f5f0f1;
+        --panel-bg: #FDF4F6;
+        --panel-border: #E3AEBC;
+        --panel-text: #2E2126;
+        --muted-text: #9C8890;
+        --brand-1: #7D1C4A;
+        --brand-2: #B5637A;
+        --brand-3: #9E4F68;
+        --card-bg: #ffffff;
+        --card-border: #EFE3E6;
+        --input-bg: #ffffff;
+        --input-border: #E3AEBC;
+        --soft-bg: #FAF3F4;
+        --danger-bg: #FBE9E7;
+        --danger-text: #C62828;
+        --success-bg: #E6F4EA;
+        --success-text: #2E7D32;
+    }
+    @media (prefers-color-scheme: dark) {
+        :root {
+            --bg-color: #121315;
+            --panel-bg: #1d1d1f;
+            --panel-border: #7a5764;
+            --panel-text: #f3edf0;
+            --muted-text: #d0b9c0;
+            --brand-1: #3d1a2a;
+            --brand-2: #7a4757;
+            --brand-3: #a35d71;
+            --card-bg: #1b1d1f;
+            --card-border: #3b3137;
+            --input-bg: #101214;
+            --input-border: #85606d;
+            --soft-bg: #1e2124;
+            --danger-bg: rgba(198,40,40,.15);
+            --danger-text: #f4b7b5;
+            --success-bg: rgba(46,125,50,.18);
+            --success-text: #c0f0c4;
+        }
+    }
+    """
+
     st.markdown(
-        """
+        f"""
         <style>
         @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@600;700&family=Inter:wght@400;500;600&display=swap');
 
-        html, body, [class*="css"]  { font-family: 'Inter', sans-serif; }
+        html, body, [class*="css"] {{ font-family: 'Inter', sans-serif; background: var(--bg-color); color: var(--panel-text); }}
+        body {{ background: var(--bg-color); }}
+        .stApp {{ background: var(--bg-color); }}
+        #MainMenu, footer {{ visibility: hidden; }}
 
-        /* Hide default Streamlit chrome for a cleaner, branded look */
-        #MainMenu, footer { visibility: hidden; }
+        {theme_css}
 
-        .brand-header {
-            background: linear-gradient(135deg, #C9748A 0%, #B5637A 55%, #9E4F68 100%);
+        /* ---------------------------------------------------------
+           Header row: title + theme toggle live INSIDE the same
+           Header banner: title sits inside the brand gradient, always
+           readable regardless of the visitor's OS light/dark preference
+           since it's white-on-gradient rather than themed text.
+        --------------------------------------------------------- */
+        .st-key-header_row {{
+            background: linear-gradient(135deg, var(--brand-1) 0%, var(--brand-2) 55%, var(--brand-3) 100%);
             padding: 22px 32px;
             border-radius: 14px;
             margin-bottom: 22px;
             box-shadow: 0 4px 18px rgba(158, 79, 104, 0.28);
-        }
-        .brand-title {
+        }}
+        .brand-title {{
             font-family: 'Playfair Display', serif;
             font-size: 30px;
             font-weight: 700;
             color: #ffffff;
             margin: 0;
             letter-spacing: 0.3px;
-        }
-        .brand-subtitle {
+        }}
+        .brand-subtitle {{
             font-size: 12px;
             font-weight: 600;
             color: rgba(255,255,255,0.88);
             letter-spacing: 3px;
             margin-top: 2px;
-        }
+        }}
 
-        /* Filter panel card */
-        .st-key-filter_panel {
-            background: #FDF4F6;
-            border: 1.5px solid #E3AEBC;
+        /* Spinner text sits directly on the page background by default,
+           which reads fine but flat. Give it a small pill so it stands
+           out clearly in both light and dark modes, like a native
+           loading indicator. */
+        [data-testid="stSpinner"] {{
+            background: var(--soft-bg);
+            border: 1px solid var(--card-border);
+            border-radius: 10px;
+            padding: 10px 14px;
+        }}
+
+        .st-key-filter_panel {{
+            background: var(--panel-bg);
+            border: 1.5px solid var(--panel-border);
             border-radius: 14px;
             padding: 18px 18px 12px 18px;
             box-shadow: 0 3px 14px rgba(158,79,104,0.10);
-        }
-        .st-key-filter_panel h3 {
+        }}
+        .st-key-filter_panel h3 {{
             font-family: 'Playfair Display', serif;
-            color: #9E4F68;
+            color: var(--brand-3);
             font-size: 18px;
             margin-top: 0;
-        }
+        }}
 
-        /* Buttons - pill, brand-colored */
-        .stButton > button {
-            background-color: #B5637A;
+        /* Streamlit renders widget labels ("Company", "Vendor", etc.)
+           with its own low-contrast default gray that was never
+           overridden - readable-ish in light mode, nearly invisible in
+           dark mode. Force them to the theme's main text color in both
+           filter panels (desktop + mobile drawer). */
+        .st-key-filter_panel [data-testid="stWidgetLabel"] p,
+        .st-key-mobile_filter_panel [data-testid="stWidgetLabel"] p,
+        .st-key-filter_panel label,
+        .st-key-mobile_filter_panel label {{
+            color: var(--panel-text) !important;
+            opacity: 1 !important;
+            font-weight: 600;
+        }}
+
+        .stButton > button {{
+            background-color: var(--brand-2);
             color: #ffffff;
             border: none;
             border-radius: 999px;
             padding: 8px 20px;
             font-weight: 600;
             transition: all 0.15s ease-in-out;
-        }
-        .stButton > button:hover {
-            background-color: #9E4F68;
+        }}
+        .stButton > button:hover {{
+            background-color: var(--brand-3);
             color: #ffffff;
             transform: translateY(-1px);
             box-shadow: 0 3px 10px rgba(158,79,104,0.35);
-        }
-        .stButton > button:disabled {
+        }}
+        .stButton > button:disabled {{
             background-color: #E7D3D8;
             color: #ffffff;
-        }
+        }}
 
-        /* Product card */
-        .product-card {
-            background: #ffffff;
+        .product-card {{
+            background: var(--card-bg);
             border-radius: 14px;
             overflow: hidden;
-            border: 1px solid #EFE3E6;
+            border: 1px solid var(--card-border);
             box-shadow: 0 2px 10px rgba(0,0,0,0.05);
             margin-bottom: 20px;
             transition: transform 0.15s ease, box-shadow 0.15s ease;
-        }
-        .product-card:hover {
+        }}
+        .product-card:hover {{
             transform: translateY(-3px);
             box-shadow: 0 8px 20px rgba(158,79,104,0.18);
-        }
-        .product-card-img {
+        }}
+        .product-card-img {{
             width: 100%;
             aspect-ratio: 1 / 1;
-            background: #FAF3F4;
+            background: var(--soft-bg);
             display: flex;
             align-items: center;
             justify-content: center;
             overflow: hidden;
-        }
-        .product-card-img img {
+        }}
+        .product-card-img img {{
             width: 100%;
             height: 100%;
             object-fit: cover;
-        }
-        .product-card-noimg {
-            color: #C9A3AF;
+        }}
+        .product-card-noimg {{
+            color: var(--muted-text);
             font-size: 13px;
             font-weight: 500;
             text-align: center;
-        }
-        .product-card-body { padding: 14px 16px 16px 16px; }
-        .product-card-title {
+        }}
+        .product-card-body {{ padding: 14px 16px 16px 16px; }}
+        .product-card-title {{
             font-size: 15px;
             font-weight: 700;
-            color: #2E2126;
+            color: var(--panel-text);
             line-height: 1.3;
             margin-bottom: 2px;
             min-height: 39px;
-        }
-        .product-card-meta {
+        }}
+        .product-card-meta {{
             font-size: 12px;
-            color: #9C8890;
+            color: var(--muted-text);
             margin-bottom: 10px;
-        }
-        .product-card-row {
+        }}
+        .product-card-row {{
             display: flex;
             justify-content: space-between;
             font-size: 12.5px;
-            color: #6B5A61;
+            color: var(--panel-text);
             padding: 3px 0;
-            border-bottom: 1px dashed #F0E4E8;
-        }
-        .product-card-row span:first-child { color: #A88F97; }
-        .product-card-row span:last-child { font-weight: 600; color: #4A3B41; }
-
-        .product-card-footer {
+            border-bottom: 1px dashed var(--card-border);
+        }}
+        .product-card-row span:first-child {{ color: var(--muted-text); }}
+        .product-card-row span:last-child {{ font-weight: 600; color: var(--panel-text); }}
+        .product-card-footer {{
             display: flex;
             justify-content: space-between;
             align-items: center;
             margin-top: 12px;
-        }
-        .price-block .sp {
+        }}
+        .price-block .sp {{
             font-size: 18px;
             font-weight: 700;
-            color: #9E4F68;
-        }
-        .price-block .cp {
+            color: var(--brand-3);
+        }}
+        .price-block .cp {{
             font-size: 11px;
-            color: #B49BA3;
-        }
-        .stock-badge {
+            color: var(--muted-text);
+        }}
+        .stock-badge {{
             font-size: 10.5px;
             font-weight: 700;
             padding: 4px 10px;
             border-radius: 999px;
             letter-spacing: 0.3px;
-        }
-        .stock-in { background: #E6F4EA; color: #2E7D32; }
-        .stock-out { background: #FBE9E7; color: #C62828; }
-
-        .page-indicator {
+        }}
+        .stock-in {{ background: var(--success-bg); color: var(--success-text); }}
+        .stock-out {{ background: var(--danger-bg); color: var(--danger-text); }}
+        .page-indicator {{
             text-align: center;
             font-weight: 600;
-            color: #9E4F68;
+            color: var(--brand-3);
             padding-top: 8px;
-        }
+        }}
 
-        /* Login card */
-        .st-key-login_card {
+        .st-key-login_card {{
             max-width: 380px;
             margin: 48px auto 0 auto;
-            background: #ffffff;
-            border: 1.5px solid #E3AEBC;
+            background: var(--card-bg);
+            border: 1.5px solid var(--panel-border);
             border-radius: 16px;
             padding: 32px 28px 24px 28px;
             box-shadow: 0 6px 24px rgba(158,79,104,0.12);
-        }
-        .st-key-login_card h3 {
+        }}
+        .st-key-login_card h3 {{
             font-family: 'Playfair Display', serif;
-            color: #9E4F68;
+            color: var(--brand-3);
             text-align: center;
             margin-top: 0;
             margin-bottom: 18px;
-        }
+        }}
 
-        /* Hide the default Streamlit top toolbar (Deploy button, menu) for a cleaner branded header */
-        [data-testid="stHeader"] { display: none; }
-        [data-testid="stToolbar"] { display: none; }
-        .block-container { padding-top: 1.5rem; }
+        /* Sits in normal document flow, right below the header banner -
+           NOT position:fixed at a hardcoded viewport coordinate, which
+           is what previously caused it to land wherever it happened to
+           overlap (banner corner, drawer heading, etc.) regardless of
+           actual layout. position:sticky keeps it reachable while
+           scrolling through the product grid, but only once the page
+           has actually scrolled past its natural spot - so at rest it
+           just sits cleanly below the banner like any other element. */
+        .st-key-mobile_filters_toggle {{
+            display: none;
+            position: sticky;
+            top: 12px;
+            z-index: 1500;
+            margin-bottom: 14px;
+            width: fit-content;
+        }}
+        .st-key-mobile_filters_toggle button {{
+            width: 46px;
+            height: 46px;
+            border-radius: 12px;
+            background: linear-gradient(135deg, #C9748A 0%, #B5637A 55%, #9E4F68 100%);
+            border: none;
+            color: #ffffff;
+            font-size: 24px;
+            line-height: 1;
+            padding: 0;
+            box-shadow: 0 6px 18px rgba(158,79,104,0.24);
+        }}
+        .st-key-mobile_filter_panel {{ display: none; }}
 
-        /* Text inputs / number inputs - border on the actual <input> element
-           itself, since Streamlit's wrapper div class names vary by
-           version and weren't reliably matching here. */
+        @media (max-width: 768px) {{
+            .st-key-filter_panel {{ display: none !important; }}
+            .st-key-mobile_filters_toggle {{ display: block; }}
+            .st-key-mobile_filter_panel {{
+                display: block;
+                position: fixed;
+                top: 0;
+                left: 0;
+                bottom: 0;
+                width: min(82vw, 320px);
+                z-index: 2000;
+                background: var(--panel-bg);
+                border-right: 1.5px solid var(--panel-border);
+                box-shadow: 12px 0 30px rgba(58, 28, 35, 0.12);
+                padding: 26px 18px 18px 18px;
+                overflow-y: auto;
+            }}
+            .st-key-mobile_filter_panel > div {{ padding-top: 8px; }}
+            .st-key-mobile_filter_panel h3 {{
+                font-family: 'Playfair Display', serif;
+                color: var(--brand-3);
+                font-size: 20px;
+                margin-top: 4px;
+                margin-bottom: 10px;
+            }}
+            .st-key-mobile_filter_panel .stButton > button {{ margin-top: 8px; }}
+            /* Close (✕) button inline with "Filters" heading, in normal
+               flow inside the drawer itself - no fixed positioning, so
+               it's always exactly where the heading row puts it. */
+            .st-key-mobile_filter_panel [data-testid="stHorizontalBlock"]:first-of-type {{
+                align-items: center;
+            }}
+            .st-key-mobile_filter_panel [data-testid="stHorizontalBlock"]:first-of-type .stButton > button {{
+                width: 32px;
+                height: 32px;
+                min-width: 32px;
+                border-radius: 8px;
+                padding: 0;
+                font-size: 14px;
+                background: var(--soft-bg);
+                color: var(--panel-text);
+                margin-top: 0;
+                box-shadow: none;
+            }}
+        }}
+
+        [data-testid="stHeader"] {{ display: none; }}
+        [data-testid="stToolbar"] {{ display: none; }}
+        .block-container {{ padding-top: 1.5rem; }}
+
         [data-testid="stTextInput"] input,
         [data-testid="stNumberInput"] input,
-        [data-testid="stTextArea"] textarea {
-            border: 1.5px solid #E3AEBC !important;
+        [data-testid="stTextArea"] textarea {{
+            border: 1.5px solid var(--input-border) !important;
             border-radius: 8px !important;
-            background-color: #ffffff !important;
+            background-color: var(--input-bg) !important;
+            color: var(--panel-text) !important;
             padding: 8px 12px !important;
-        }
+        }}
+        div[data-baseweb="select"] > div,
+        div[data-baseweb="select"] > div > div,
+        div[data-baseweb="select"] > div > div > div,
+        div[data-baseweb="select"] > div > div > div > div {{
+            background-color: var(--input-bg) !important;
+            color: var(--panel-text) !important;
+            border-color: var(--input-border) !important;
+        }}
         [data-testid="stTextInput"] input:focus,
         [data-testid="stNumberInput"] input:focus,
-        [data-testid="stTextArea"] textarea:focus {
-            border-color: #B5637A !important;
-            box-shadow: 0 0 0 1px #B5637A !important;
-        }
+        [data-testid="stTextArea"] textarea:focus {{
+            border-color: var(--brand-3) !important;
+            box-shadow: 0 0 0 1px var(--brand-3) !important;
+        }}
         [data-testid="stTextInput"] input::placeholder,
-        [data-testid="stTextArea"] textarea::placeholder {
-            color: #C9A3AF !important;
+        [data-testid="stTextArea"] textarea::placeholder {{
+            color: var(--muted-text) !important;
             opacity: 1 !important;
-        }
-        /* Some Streamlit versions also render a bordered wrapper div around
-           the input - keep it transparent so it doesn't double up or clash. */
+        }}
         div[data-baseweb="base-input"],
-        div[data-baseweb="input"] {
+        div[data-baseweb="input"] {{
             border: none !important;
             background-color: transparent !important;
-        }
+        }}
 
-        /* Select / multiselect boxes - same treatment */
-        div[data-baseweb="select"] > div {
-            border: 1.5px solid #E3AEBC !important;
+        div[data-baseweb="select"] > div {{
+            border: 1.5px solid var(--input-border) !important;
             border-radius: 8px !important;
-            background-color: #ffffff !important;
-        }
-        div[data-baseweb="select"]:focus-within > div {
-            border-color: #B5637A !important;
-        }
+            background-color: var(--input-bg) !important;
+        }}
+        div[data-baseweb="select"]:focus-within > div {{
+            border-color: var(--brand-3) !important;
+        }}
+        /* The text you type to search/filter options lives in a plain
+           <input> nested inside the select box above - the background
+           rules on the containing divs don't touch it, so it kept its
+           own default (dark) text color and stayed unreadable on a
+           dark background. Color it and its placeholder explicitly. */
+        div[data-baseweb="select"] input {{
+            color: var(--panel-text) !important;
+            -webkit-text-fill-color: var(--panel-text) !important;
+        }}
+        div[data-baseweb="select"] input::placeholder {{
+            color: var(--muted-text) !important;
+            opacity: 1 !important;
+        }}
 
-        /* Branded spinner */
-        [data-testid="stSpinner"] > div > div {
-            border-top-color: #B5637A !important;
-        }
-        [data-testid="stSpinner"] p {
-            color: #9E4F68 !important;
+        /* The multiselect/select OPTIONS dropdown renders in a separate
+           floating portal (data-baseweb="popover"), outside the input
+           box styled above - it was left with Streamlit's built-in
+           light-mode-only colors AND its own default sharp-cornered,
+           unbordered panel styling, so it read as a mismatched, floating
+           box rather than part of the same rounded-pill input below it.
+           Theme the popover, its menu list, individual options, and the
+           select-all row explicitly, and match the input's 8px radius,
+           border color/width, and give it a bit of separation via
+           shadow instead of a hard edge. */
+        div[data-baseweb="popover"] {{
+            background-color: var(--input-bg) !important;
+            border: 1.5px solid var(--input-border) !important;
+            border-radius: 8px !important;
+            box-shadow: 0 8px 20px rgba(0,0,0,0.18) !important;
+            overflow: hidden;
+        }}
+        div[data-baseweb="popover"] [role="listbox"],
+        div[data-baseweb="popover"] ul[data-baseweb="menu"] {{
+            background-color: var(--input-bg) !important;
+            border: none !important;
+            border-radius: 8px !important;
+        }}
+        div[data-baseweb="popover"] li[role="option"],
+        div[data-baseweb="popover"] [data-baseweb="menu"] > li {{
+            background-color: var(--input-bg) !important;
+            color: var(--panel-text) !important;
+            border-bottom: 1px solid var(--card-border) !important;
+        }}
+        div[data-baseweb="popover"] li[role="option"]:last-child {{
+            border-bottom: none !important;
+        }}
+        div[data-baseweb="popover"] li[role="option"] * {{
+            color: var(--panel-text) !important;
+        }}
+        div[data-baseweb="popover"] li[role="option"]:hover,
+        div[data-baseweb="popover"] li[aria-selected="true"] {{
+            background-color: var(--soft-bg) !important;
+        }}
+        /* "Select all N matches" row and any helper/empty-state text */
+        div[data-baseweb="popover"] div,
+        div[data-baseweb="popover"] span {{
+            color: var(--panel-text);
+        }}
+
+        [data-testid="stSpinner"] > div > div {{
+            border-top-color: var(--brand-2) !important;
+        }}
+        [data-testid="stSpinner"] p {{
+            color: var(--brand-3) !important;
             font-weight: 600;
-        }
+        }}
         </style>
         """,
         unsafe_allow_html=True,
@@ -342,15 +583,19 @@ def inject_theme():
 
 
 def render_header():
-    st.markdown(
-        f"""
-        <div class="brand-header">
+    """Title banner. Theme is fully automatic - driven by the visitor's
+    OS/browser color-scheme preference via CSS `prefers-color-scheme`
+    (see inject_theme) - so there's no manual toggle to keep in sync;
+    every element on the page is styled with theme CSS variables that
+    resolve correctly for either preference."""
+    with st.container(key="header_row"):
+        st.markdown(
+            f"""
             <div class="brand-title">{html_lib.escape(APP_TITLE)}</div>
             <div class="brand-subtitle">{html_lib.escape(APP_SUBTITLE)}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+            """,
+            unsafe_allow_html=True,
+        )
 
 
 def set_authenticated(value: bool):
@@ -490,6 +735,18 @@ def _read_delta_lazy(lakehouse_id, schema, table, columns) -> pl.LazyFrame:
     ).lazy()
 
 
+def _read_delta_lazy_fallback(lakehouse_id, schema, table, candidates):
+    last_error = None
+    for columns in candidates:
+        try:
+            return _read_delta_lazy(lakehouse_id, schema, table, columns)
+        except Exception as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    return _read_delta_lazy(lakehouse_id, schema, table, [])
+
+
 @st.cache_data(ttl=DATA_TTL_SECONDS, show_spinner="Loading product & inventory data...")
 def build_inventory_df() -> pd.DataFrame:
     """Cached across all users of this deployed app for DATA_TTL_SECONDS.
@@ -587,42 +844,66 @@ def build_inventory_df() -> pd.DataFrame:
     # image exists for a product it's the one kept - doing it in the
     # opposite order risks .unique(keep="first") locking in a blank row
     # before the real image ever gets a chance to survive.
-    product_images = _read_delta_lazy(
-        lakehouse_id_bronze, "Odoo", "product_images",
-        columns=["product_id", "image_1920"],
+    image_columns = ["image_1920", "image_1024", "image_512", "image", "image_url", "image_link"]
+    image_candidates = [
+        ["product_id", "image_1920"],
+        ["product_id", "image_1920", "image_1024"],
+        ["product_id", "image_1920", "image_1024", "image_512"],
+        ["product_id", "image_1920", "image_1024", "image_512", "image"],
+        ["product_id", "image_1920", "image", "image_url", "image_link"],
+        ["product_id", "image_1920", "image_url", "image_link"],
+        ["product_id"],
+    ]
+    product_images = _read_delta_lazy_fallback(
+        lakehouse_id_bronze, "Odoo", "product_images", image_candidates
     ).with_columns(
         pl.col("product_id").cast(pl.Utf8)
-    ).filter(
+    )
+
+    available_image_columns = [col for col in image_columns if col in product_images.columns]
+    if not available_image_columns:
+        product_images = product_images.with_columns(
+            pl.lit(None).cast(pl.Utf8).alias("image_1920")
+        )
+    else:
+        product_images = product_images.with_columns(
+            pl.coalesce([
+                pl.col(col).cast(pl.Utf8, strict=False) for col in available_image_columns
+            ]).alias("image_1920")
+        )
+
+    product_images = product_images.filter(
         pl.col("image_1920").is_not_null()
         & (pl.col("image_1920") != "")
         & (pl.col("image_1920") != "False")
     ).unique(subset=["product_id"], keep="first")
 
-    # Inner join: only keep products that actually have a matching row in
-    # product_images (drops products with no image reference at all).
-    # IMPORTANT: product_images is keyed by the internal product_id
-    # (Odoo's product.product id), not by the display sku - so we join on
-    # product_id here even though sku is now a separate, human-readable field.
+    # Keep all products even when no image exists. The UI renders a
+    # "No image available" placeholder instead of dropping the row.
     final = inventory.join(
         product_images, on="product_id",
-        how="inner", suffix="_img",
+        how="left", suffix="_img",
     )
 
     final = final.select([
         "company", "category", "vendor", "sku", "lot_number", "location",
         "product_name", "cp", "sp", "available_inventory",
-        "available_selling_price", "product_id", "overall_age", "image_1920",
-    ]).filter(
-        # Belt-and-braces: also drop rows where image_1920 itself is
-        # null/empty, or the literal string "False" that Odoo sometimes
-        # writes for an empty image field.
-        pl.col("image_1920").is_not_null()
-        & (pl.col("image_1920") != "")
-        & (pl.col("image_1920") != "False")
+        "available_selling_price", "product_id", "overall_age",
+        pl.col("image_1920").fill_null("No image available").alias("image_1920"),
+    ])
+
+    # Products with a real image should surface first, always - this is
+    # the PRIMARY sort key (evaluated before company/category/etc.), and
+    # it's baked into the base dataframe rather than applied later, so
+    # it holds no matter which filters (if any) get applied downstream:
+    # pandas boolean-mask filtering preserves row order, so a filtered
+    # view is just a subset of this same ordering, not a re-sort.
+    final = final.with_columns(
+        (pl.col("image_1920") == "No image available").alias("_no_image")
     ).sort(
-        ["company", "category", "vendor", "sku", "lot_number"],
+        ["_no_image", "company", "category", "vendor", "sku", "lot_number"],
         nulls_last=True,
-    )
+    ).drop("_no_image")
 
     # .collect(engine="streaming") runs the whole lazy join plan in
     # chunks rather than materializing everything in one block - this
@@ -639,7 +920,12 @@ def apply_filters(df, f):
     if f["company"]:
         out = out[out["company"].isin(f["company"])]
     if f["category"]:
-        out = out[out["category"].isin(f["category"])]
+        category_values = f["category"]
+        out = out[
+            out["category"].fillna("").map(
+                lambda value: category_matches_selected(value, category_values)
+            )
+        ]
     if f["vendor"]:
         out = out[out["vendor"].isin(f["vendor"])]
     if f["location"]:
@@ -655,43 +941,50 @@ def apply_filters(df, f):
         out = out[out["lot_number"].astype(str).str.lower().str.contains(needle, na=False)]
     if f["in_stock_only"]:
         out = out[out["available_inventory"].fillna(0) > 0]
-    if f["price_range"]:
-        lo, hi = f["price_range"]
-        out = out[out["sp"].fillna(0).between(lo, hi)]
     return out
 
 
-def render_filters(df) -> dict:
-    with st.container(key="filter_panel"):
-        st.markdown("<h3>Filters</h3>", unsafe_allow_html=True)
+def render_filters(df, panel_key: str = "filter_panel") -> dict:
+    with st.container(key=panel_key):
+        if panel_key == "mobile_filter_panel":
+            # The open drawer carries its own close button, laid out
+            # inline with the heading (normal document flow) rather
+            # than a separate floating icon - so it's always exactly
+            # where it visually belongs, with no overlap risk.
+            head_col, close_col = st.columns([5, 1])
+            with head_col:
+                st.markdown("<h3>Filters</h3>", unsafe_allow_html=True)
+            with close_col:
+                if st.button("✕", key=f"{panel_key}_close", help="Close filters"):
+                    st.session_state.mobile_filters_open = False
+                    st.rerun()
+        else:
+            st.markdown("<h3>Filters</h3>", unsafe_allow_html=True)
 
-        company = st.multiselect("Company", sorted(df["company"].dropna().unique()))
-        category = st.multiselect("Category", sorted(df["category"].dropna().unique()))
-        vendor = st.multiselect("Vendor", sorted(df["vendor"].dropna().unique()))
-        location = st.multiselect("Location", sorted(df["location"].dropna().unique()))
+        company = st.multiselect("Company", sorted(df["company"].dropna().unique()), key=f"{panel_key}_company")
 
-        search = st.text_input("Product/SKU)")
-        lot_number = st.text_input("Lot number")
+        category_values = sorted({value for raw in df["category"].dropna().tolist() for value in expand_category_hierarchy(raw)})
+        category = st.multiselect("Category", category_values, key=f"{panel_key}_category")
 
-        in_stock_only = st.checkbox("In stock only", value=False)
+        vendor = st.multiselect("Vendor", sorted(df["vendor"].dropna().unique()), key=f"{panel_key}_vendor")
+        location = st.multiselect("Location", sorted(df["location"].dropna().unique()), key=f"{panel_key}_location")
 
-        sp_series = df["sp"].dropna()
+        search = st.text_input("Product/SKU", key=f"{panel_key}_search")
+        lot_number = st.text_input("Lot Number", key=f"{panel_key}_lot")
+
+        in_stock_only = st.checkbox("In stock only", value=False, key=f"{panel_key}_stock")
         price_range = None
-        # if not sp_series.empty:
-        #     lo, hi = float(sp_series.min()), float(sp_series.max())
-        #     if lo < hi:
-        #         price_range = st.slider("Selling price range", lo, hi, (lo, hi))
 
-        cols_per_row = st.slider("Columns per row", min_value=2, max_value=6, value=4)
+        cols_per_row = st.slider("Columns per row", min_value=2, max_value=6, value=4, key=f"{panel_key}_cols")
 
         st.markdown("<br>", unsafe_allow_html=True)
-        if st.button("🔄 Refresh data now", width="stretch"):
+        if st.button("🔄 Refresh data now", key=f"{panel_key}_refresh", width="stretch"):
             build_inventory_df.clear()
             load_image_cached.clear()
             st.session_state.page = 1
             st.rerun()
 
-        if st.button("🚪 Logout", width="stretch"):
+        if st.button("🚪 Logout", key=f"{panel_key}_logout", width="stretch"):
             set_authenticated(False)
             st.rerun()
 
@@ -738,6 +1031,10 @@ def render_card_html(item, img) -> str:
     if img is not None:
         img_html = f'<img src="{image_to_data_uri(img)}" alt="" />'
     else:
+        img_html = '<div class="product-card-noimg">No image<br>available</div>'
+
+    image_ref = item.get("image_1920")
+    if isinstance(image_ref, str) and image_ref in ("", "False", "None"):
         img_html = '<div class="product-card-noimg">No image<br>available</div>'
 
     qty = item.get("available_inventory")
@@ -794,13 +1091,28 @@ def main():
         st.error(f"Failed to connect / fetch data: {e}")
         return
 
+    if "mobile_filters_open" not in st.session_state:
+        st.session_state.mobile_filters_open = False
+
+    # Hamburger button for mobile users: opens a left-aligned filter drawer
+    # while leaving the desktop two-panel layout completely unchanged.
+    # Only rendered while the drawer is CLOSED - the open drawer gets its
+    # own dedicated close (✕) button inside render_filters() instead of
+    # reusing this one, so there's never a floating icon that can end up
+    # sitting on top of the drawer's own heading or the banner above it.
+    if not st.session_state.mobile_filters_open:
+        if st.button("☰", key="mobile_filters_toggle", help="Open filters"):
+            st.session_state.mobile_filters_open = True
+            st.rerun()
+
     # Desktop: left pane (filters) / right pane (results).
-    # On narrow / mobile viewports Streamlit stacks these vertically,
-    # so filters appear above the results instead of beside them.
     filter_col, results_col = st.columns([1, 3])
 
     with filter_col:
-        filters = render_filters(full_df)
+        filters = render_filters(full_df, "filter_panel")
+
+    if st.session_state.mobile_filters_open:
+        filters = render_filters(full_df, "mobile_filter_panel")
 
     with results_col:
         df = apply_filters(full_df, filters)  # empty filters => full_df, unchanged
@@ -824,7 +1136,7 @@ def main():
         cols_per_row = filters["cols_per_row"]
 
         st.markdown(
-            f"<div style='color:#9C8890; font-size:13px; margin-bottom:8px;'>"
+            f"<div style='color: var(--muted-text); font-size:13px; margin-bottom:8px;'>"
             f"{total} product{'s' if total != 1 else ''} found</div>",
             unsafe_allow_html=True,
         )
