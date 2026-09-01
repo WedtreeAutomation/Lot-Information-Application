@@ -944,7 +944,30 @@ def apply_filters(df, f):
     return out
 
 
-def render_filters(df, panel_key: str = "filter_panel") -> dict:
+@st.cache_data(ttl=DATA_TTL_SECONDS, show_spinner=False)
+def compute_filter_options(df: pd.DataFrame) -> dict:
+    """Precompute the option lists for every filter dropdown once, from
+    the full base dataframe. Previously this work (including the
+    category-hierarchy expansion, a Python-level loop) ran inline inside
+    render_filters() on every single Streamlit rerun, AND ran a second
+    time whenever the mobile drawer was open, since render_filters() was
+    called once for the (CSS-hidden but still executed) desktop panel and
+    again for the mobile panel. Cached here and computed once per data
+    refresh, then shared by both panels - that's what made opening the
+    mobile filter drawer feel slow."""
+    return {
+        "company": sorted(df["company"].dropna().unique()),
+        "category": sorted({
+            value
+            for raw in df["category"].dropna().tolist()
+            for value in expand_category_hierarchy(raw)
+        }),
+        "vendor": sorted(df["vendor"].dropna().unique()),
+        "location": sorted(df["location"].dropna().unique()),
+    }
+
+
+def render_filters(df, options: dict, panel_key: str = "filter_panel") -> dict:
     with st.container(key=panel_key):
         if panel_key == "mobile_filter_panel":
             # The open drawer carries its own close button, laid out
@@ -961,13 +984,10 @@ def render_filters(df, panel_key: str = "filter_panel") -> dict:
         else:
             st.markdown("<h3>Filters</h3>", unsafe_allow_html=True)
 
-        company = st.multiselect("Company", sorted(df["company"].dropna().unique()), key=f"{panel_key}_company")
-
-        category_values = sorted({value for raw in df["category"].dropna().tolist() for value in expand_category_hierarchy(raw)})
-        category = st.multiselect("Category", category_values, key=f"{panel_key}_category")
-
-        vendor = st.multiselect("Vendor", sorted(df["vendor"].dropna().unique()), key=f"{panel_key}_vendor")
-        location = st.multiselect("Location", sorted(df["location"].dropna().unique()), key=f"{panel_key}_location")
+        company = st.multiselect("Company", options["company"], key=f"{panel_key}_company")
+        category = st.multiselect("Category", options["category"], key=f"{panel_key}_category")
+        vendor = st.multiselect("Vendor", options["vendor"], key=f"{panel_key}_vendor")
+        location = st.multiselect("Location", options["location"], key=f"{panel_key}_location")
 
         search = st.text_input("Product/SKU", key=f"{panel_key}_search")
         lot_number = st.text_input("Lot Number", key=f"{panel_key}_lot")
@@ -981,6 +1001,7 @@ def render_filters(df, panel_key: str = "filter_panel") -> dict:
         if st.button("🔄 Refresh data now", key=f"{panel_key}_refresh", width="stretch"):
             build_inventory_df.clear()
             load_image_cached.clear()
+            compute_filter_options.clear()
             st.session_state.page = 1
             st.rerun()
 
@@ -1108,11 +1129,13 @@ def main():
     # Desktop: left pane (filters) / right pane (results).
     filter_col, results_col = st.columns([1, 3])
 
+    filter_options = compute_filter_options(full_df)
+
     with filter_col:
-        filters = render_filters(full_df, "filter_panel")
+        filters = render_filters(full_df, filter_options, "filter_panel")
 
     if st.session_state.mobile_filters_open:
-        filters = render_filters(full_df, "mobile_filter_panel")
+        filters = render_filters(full_df, filter_options, "mobile_filter_panel")
 
     with results_col:
         df = apply_filters(full_df, filters)  # empty filters => full_df, unchanged
