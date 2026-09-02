@@ -52,7 +52,7 @@ MAX_WORKERS = 20
 # How long cached data/images stay valid before being refetched from
 # OneLake automatically. Lower this (e.g. 60 * 60 for hourly) if you
 # need fresher data; raise it to cut down on OneLake calls.
-DATA_TTL_SECONDS =  60 * 60  # 1 hr
+DATA_TTL_SECONDS =  60 * 60 * 24 # 1 hr
 
 # ===========================================================
 # Fabric / OneLake connection details - read from Streamlit secrets.
