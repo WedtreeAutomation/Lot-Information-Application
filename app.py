@@ -674,7 +674,7 @@ def render_header():
         st.markdown(
             f"""
             <div class="brand-title">{html_lib.escape(APP_TITLE)}</div>
-            <div class="brand-subtitle">{html_lib.escape(APP_SUBTITLE)}</div>f
+            <div class="brand-subtitle">{html_lib.escape(APP_SUBTITLE)}</div>
             """,
             unsafe_allow_html=True,
         )
