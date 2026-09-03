@@ -52,7 +52,8 @@ MAX_WORKERS = 20
 # How long cached data/images stay valid before being refetched from
 # OneLake automatically. Lower this (e.g. 60 * 60 for hourly) if you
 # need fresher data; raise it to cut down on OneLake calls.
-DATA_TTL_SECONDS =  60 * 60 * 24 # 1 hr
+DATA_TTL_SECONDS =  60 * 60 * 24 # 1 day
+DATA_FILTER_VERSION = 2
 
 # ===========================================================
 # Fabric / OneLake connection details - read from Streamlit secrets.
@@ -91,6 +92,14 @@ COMPANY_LABELS = {
     "Wedtree eStore Private Limited - T Nagar": "T Nagar",
     "Wedtree eStore Private Limited - HO": "HO",
 }
+
+EXCLUDED_COMPANIES = {"Saree Trails", "Wedtree eStore Private Limited - Online"}
+EXCLUDED_LOCATIONS = {
+    "Physical Locations/Subcontracting Location",
+    "Virtual Locations/Production",
+}
+EXCLUDED_LOCATION_SUBSTRING = "CONSUMABLE"
+EXCLUDED_CATEGORY_PREFIX = "ADMIN"
 
 
 def table_uri(lakehouse_id: str, schema: str, table: str) -> str:
@@ -134,6 +143,15 @@ def category_matches_selected(category_value, selected_values):
         if category_value == selected_value or category_value.startswith(selected_value + " / "):
             return True
     return False
+
+
+def location_is_excluded(location) -> bool:
+    if location is None or pd.isna(location):
+        return False
+    return (
+        location in EXCLUDED_LOCATIONS
+        or EXCLUDED_LOCATION_SUBSTRING in str(location).upper()
+    )
 
 
 # ===========================================================
@@ -247,6 +265,16 @@ def inject_theme():
             color: var(--brand-3);
             font-size: 18px;
             margin-top: 0;
+        }}
+        .st-key-filter_panel [data-baseweb="select"],
+        .st-key-filter_panel [data-baseweb="select"] input,
+        .st-key-mobile_filter_panel [data-baseweb="select"],
+        .st-key-mobile_filter_panel [data-baseweb="select"] input {{
+            font-size: 13px !important;
+        }}
+        .st-key-filter_panel [data-baseweb="tag"],
+        .st-key-mobile_filter_panel [data-baseweb="tag"] {{
+            font-size: 12px !important;
         }}
 
         /* Streamlit renders widget labels ("Company", "Vendor", etc.)
@@ -467,7 +495,7 @@ def inject_theme():
                 top: 0;
                 left: 0;
                 bottom: 0;
-                width: min(82vw, 320px);
+                width: min(88vw, 380px);
                 z-index: 2000;
                 background: var(--panel-bg);
                 border-right: 1.5px solid var(--panel-border);
@@ -561,6 +589,8 @@ def inject_theme():
             border: 1.5px solid var(--input-border) !important;
             border-radius: 8px !important;
             box-shadow: 0 8px 20px rgba(0,0,0,0.18) !important;
+            width: max-content !important;
+            max-width: min(92vw, 720px) !important;
             overflow: hidden;
         }}
         div[data-baseweb="popover"] [role="listbox"],
@@ -574,12 +604,20 @@ def inject_theme():
             background-color: var(--input-bg) !important;
             color: var(--panel-text) !important;
             border-bottom: 1px solid var(--card-border) !important;
+            height: auto !important;
+            min-height: 40px !important;
+            white-space: normal !important;
+            overflow: visible !important;
+            text-overflow: clip !important;
         }}
         div[data-baseweb="popover"] li[role="option"]:last-child {{
             border-bottom: none !important;
         }}
         div[data-baseweb="popover"] li[role="option"] * {{
             color: var(--panel-text) !important;
+            white-space: normal !important;
+            overflow: visible !important;
+            text-overflow: clip !important;
         }}
         div[data-baseweb="popover"] li[role="option"]:hover,
         div[data-baseweb="popover"] li[aria-selected="true"] {{
@@ -589,6 +627,28 @@ def inject_theme():
         div[data-baseweb="popover"] div,
         div[data-baseweb="popover"] span {{
             color: var(--panel-text);
+        }}
+
+        /* Long selected values are compacted into BaseWeb tags. Expand the
+           tag while hovering so the complete category/location is readable. */
+        [data-baseweb="tag"] {{
+            max-width: 100% !important;
+        }}
+        [data-baseweb="tag"] span {{
+            overflow: hidden !important;
+            text-overflow: ellipsis !important;
+            white-space: nowrap !important;
+        }}
+        [data-baseweb="tag"]:hover {{
+            position: relative !important;
+            z-index: 10 !important;
+            max-width: min(90vw, 620px) !important;
+        }}
+        [data-baseweb="tag"]:hover span {{
+            overflow: visible !important;
+            text-overflow: clip !important;
+            white-space: normal !important;
+            word-break: break-word !important;
         }}
 
         [data-testid="stSpinner"] > div > div {{
@@ -614,7 +674,7 @@ def render_header():
         st.markdown(
             f"""
             <div class="brand-title">{html_lib.escape(APP_TITLE)}</div>
-            <div class="brand-subtitle">{html_lib.escape(APP_SUBTITLE)}</div>
+            <div class="brand-subtitle">{html_lib.escape(APP_SUBTITLE)}</div>f
             """,
             unsafe_allow_html=True,
         )
@@ -770,7 +830,7 @@ def _read_delta_lazy_fallback(lakehouse_id, schema, table, candidates):
 
 
 @st.cache_data(ttl=DATA_TTL_SECONDS, show_spinner="Loading product & inventory data...")
-def build_inventory_df() -> pd.DataFrame:
+def build_inventory_df(data_filter_version: int = DATA_FILTER_VERSION) -> pd.DataFrame:
     """Cached across all users of this deployed app for DATA_TTL_SECONDS.
     After the TTL expires, the next page load re-fetches from OneLake and
     picks up any new/changed rows. Use the Refresh button for an immediate
@@ -866,14 +926,14 @@ def build_inventory_df() -> pd.DataFrame:
     # image exists for a product it's the one kept - doing it in the
     # opposite order risks .unique(keep="first") locking in a blank row
     # before the real image ever gets a chance to survive.
-    image_columns = ["image_1920", "image_1024", "image_512", "image", "image_url", "image_link"]
+    image_columns = ["image_1920"]
     image_candidates = [
         ["product_id", "image_1920"],
-        ["product_id", "image_1920", "image_1024"],
-        ["product_id", "image_1920", "image_1024", "image_512"],
-        ["product_id", "image_1920", "image_1024", "image_512", "image"],
-        ["product_id", "image_1920", "image", "image_url", "image_link"],
-        ["product_id", "image_1920", "image_url", "image_link"],
+        # ["product_id", "image_1920", "image_1024"],
+        # ["product_id", "image_1920", "image_1024", "image_512"],
+        # ["product_id", "image_1920", "image_1024", "image_512", "image"],
+        # ["product_id", "image_1920", "image", "image_url", "image_link"],
+        # ["product_id", "image_1920", "image_url", "image_link"],
         ["product_id"],
     ]
     product_images = _read_delta_lazy_fallback(
@@ -914,6 +974,25 @@ def build_inventory_df() -> pd.DataFrame:
         pl.col("image_1920").fill_null("No image available").alias("image_1920"),
     ])
 
+    # Remove excluded records before the dataframe reaches the UI. This
+    # keeps counts, pagination, searches, and all filter options based on
+    # the same dataset.
+    final = final.filter(
+        ~pl.col("company").is_in(EXCLUDED_COMPANIES)
+        & ~pl.col("location").is_in(EXCLUDED_LOCATIONS)
+        & ~pl.col("location")
+            .cast(pl.Utf8)
+            .fill_null("")
+            .str.to_uppercase()
+            .str.contains(EXCLUDED_LOCATION_SUBSTRING, literal=True)
+        & ~pl.col("category")
+            .cast(pl.Utf8)
+            .fill_null("")
+            .str.strip_chars()
+            .str.to_uppercase()
+            .str.starts_with(EXCLUDED_CATEGORY_PREFIX)
+    )
+
     # Products with a real image should surface first, always - this is
     # the PRIMARY sort key (evaluated before company/category/etc.), and
     # it's baked into the base dataframe rather than applied later, so
@@ -931,7 +1010,14 @@ def build_inventory_df() -> pd.DataFrame:
     # chunks rather than materializing everything in one block - this
     # matters on a machine with limited RAM once the underlying tables
     # get large, since it avoids single huge allocations.
-    return final.collect(engine="streaming").to_pandas()
+    final_df = final.collect(engine="streaming").to_pandas()
+    return final_df.loc[
+        ~final_df["company"].isin(EXCLUDED_COMPANIES)
+        & ~final_df["location"].map(location_is_excluded)
+        & ~final_df["category"].fillna("").astype(str).str.strip().str.upper().str.startswith(
+            EXCLUDED_CATEGORY_PREFIX
+        )
+    ].reset_index(drop=True)
 
 
 # ===========================================================
@@ -978,32 +1064,26 @@ def compute_filter_options(df: pd.DataFrame) -> dict:
     refresh, then shared by both panels - that's what made opening the
     mobile filter drawer feel slow."""
 
-    excluded_companies = {"Saree Trails", "Wedtree eStore Private Limited - Online"}
-
     company_values = [
         value for value in sorted(df["company"].dropna().unique())
-        if value not in excluded_companies
+        if value not in EXCLUDED_COMPANIES
     ]
+    valid_locations = {
+        value for value in df["location"].dropna().unique()
+        if not location_is_excluded(value)
+    }
     category_values = sorted({
         value
         for raw in df["category"].dropna().tolist()
         for value in expand_category_hierarchy(raw)
-        if not str(value).strip().upper().startswith("ADMIN")
+        if not str(value).strip().upper().startswith(EXCLUDED_CATEGORY_PREFIX)
     })
-
-    excluded_locations = {
-        "Physical Locations/Subcontracting Location",
-        "Virtual Locations/Production",
-    }
 
     return {
         "company": company_values,
         "category": category_values,
         "vendor": sorted(df["vendor"].dropna().unique()),
-        "location": [
-            value for value in sorted(df["location"].dropna().unique())
-            if value not in excluded_locations
-        ],
+        "location": sorted(valid_locations),
     }
 
 
@@ -1043,13 +1123,75 @@ def render_filters(df, options: dict, panel_key: str = "filter_panel") -> dict:
         )
         filter_state["company"] = company
 
-        category = st.multiselect(
+        # --- Category with shortened display labels ---
+        category_options = options["category"]
+        
+        # Create display labels: show last 2-3 parts of the path, or
+        # truncate to a reasonable length
+        def make_display_label(full_path):
+            if not full_path:
+                return full_path
+            parts = full_path.split(" / ")
+            if len(parts) <= 2:
+                return full_path
+            # Show last 2 parts with ellipsis
+            return "… / " + " / ".join(parts[-2:])
+        
+        # Build mapping from full path to display label
+        display_map = {cat: make_display_label(cat) for cat in category_options}
+        
+        # Create options with display labels
+        display_options = [display_map[cat] for cat in category_options]
+        
+        # Get currently selected values (full paths)
+        current_selected = filter_state.get("category", [])
+        
+        # Map selected full paths to display labels for the widget
+        selected_display = [display_map.get(cat, cat) for cat in current_selected if cat in display_map]
+        
+        # Create a custom multiselect using format_func
+        selected_display_labels = st.multiselect(
             "Category",
-            options["category"],
-            default=filter_state.get("category", []),
-            key="filters_category",
+            display_options,
+            default=selected_display,
+            key=f"filters_category_{panel_key}",
+            format_func=lambda x: x,
         )
-        filter_state["category"] = category
+        
+        # Convert selected display labels back to full paths
+        # Find which full paths match the selected display labels
+        reverse_map = {}
+        for full_path, display_label in display_map.items():
+            if display_label not in reverse_map:
+                reverse_map[display_label] = []
+            reverse_map[display_label].append(full_path)
+        
+        selected_full_paths = []
+        for display_label in selected_display_labels:
+            # If multiple full paths share the same display label, 
+            # select the first one (shouldn't happen with our mapping)
+            matches = reverse_map.get(display_label, [])
+            if matches:
+                selected_full_paths.append(matches[0])
+            else:
+                # Fallback: try to find by display_label as full path
+                if display_label in category_options:
+                    selected_full_paths.append(display_label)
+        
+        # Preserve any selected values that might not match display labels
+        # (for backward compatibility)
+        for cat in current_selected:
+            if cat not in selected_full_paths and cat in category_options:
+                # Check if this category's display label is selected
+                if display_map.get(cat) in selected_display_labels:
+                    pass  # Already handled
+                elif display_map.get(cat) not in selected_display_labels:
+                    # Only add if not already there
+                    selected_full_paths.append(cat)
+        
+        # Remove duplicates
+        selected_full_paths = list(dict.fromkeys(selected_full_paths))
+        filter_state["category"] = selected_full_paths
 
         vendor = st.multiselect(
             "Vendor",
@@ -1064,10 +1206,14 @@ def render_filters(df, options: dict, panel_key: str = "filter_panel") -> dict:
                 value for value in sorted(
                     df.loc[df["company"].isin(company), "location"].dropna().unique()
                 )
-                if value not in {"Physical Locations/Subcontracting Location", "Virtual Locations/Production"}
+                if not location_is_excluded(value)
             ]
         else:
             location_options = options["location"]
+        filter_state["location"] = [
+            value for value in filter_state.get("location", [])
+            if value in location_options
+        ]
         location = st.multiselect(
             "Location",
             location_options,
@@ -1121,7 +1267,7 @@ def render_filters(df, options: dict, panel_key: str = "filter_panel") -> dict:
 
     return {
         "company": company,
-        "category": category,
+        "category": filter_state["category"],
         "vendor": vendor,
         "location": location,
         "search": search,
@@ -1217,7 +1363,7 @@ def main():
 
     try:
         with st.spinner("Loading your product gallery..."):
-            full_df = build_inventory_df()
+            full_df = build_inventory_df(DATA_FILTER_VERSION)
     except Exception as e:
         st.error(f"Failed to connect / fetch data: {e}")
         return
@@ -1299,7 +1445,7 @@ def main():
                     st.session_state.page += 1
                     st.rerun()
     else:
-        filter_col, results_col = st.columns([1, 3])
+        filter_col, results_col = st.columns([1.25, 3])
         with filter_col:
             filters = render_filters(full_df, filter_options, "filter_panel")
         with results_col:
