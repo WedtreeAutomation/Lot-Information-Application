@@ -674,7 +674,7 @@ def render_header():
         st.markdown(
             f"""
             <div class="brand-title">{html_lib.escape(APP_TITLE)}</div>
-            <div class="brand-subtitle">{html_lib.escape(APP_SUBTITLE)}</div>
+            <div class="brand-subtitle">{html_lib.escape(APP_SUBTITLE)}</div>f
             """,
             unsafe_allow_html=True,
         )
@@ -1049,6 +1049,8 @@ def apply_filters(df, f):
         out = out[out["lot_number"].astype(str).str.lower().str.contains(needle, na=False)]
     if f["in_stock_only"]:
         out = out[out["available_inventory"].fillna(0) > 0]
+    if f["without_images"]:
+        out = out[out["image_1920"] == "No image available"]
     return out
 
 
@@ -1096,6 +1098,7 @@ def render_filters(df, options: dict, panel_key: str = "filter_panel") -> dict:
         "search": "",
         "lot_number": "",
         "in_stock_only": False,
+        "without_images": False,
         "cols_per_row": 4,
     })
 
@@ -1234,6 +1237,13 @@ def render_filters(df, options: dict, panel_key: str = "filter_panel") -> dict:
             key="filters_stock",
         )
         filter_state["in_stock_only"] = in_stock_only
+
+        without_images = st.checkbox(
+            "Without images",
+            value=filter_state.get("without_images", False),
+            key="filters_without_images",
+        )
+        filter_state["without_images"] = without_images
         price_range = None
 
         cols_per_row = st.slider(
@@ -1273,6 +1283,7 @@ def render_filters(df, options: dict, panel_key: str = "filter_panel") -> dict:
         "search": search,
         "lot_number": lot_number,
         "in_stock_only": in_stock_only,
+        "without_images": without_images,
         "price_range": price_range,
         "cols_per_row": cols_per_row,
     }
