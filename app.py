@@ -1,10 +1,14 @@
 import sys
 import asyncio
 
-if sys.platform.startswith("win"):
+if sys.platform.startswith("win") and sys.version_info < (3, 14):
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 import base64
+import hashlib
+import hmac
+import logging
+import time
 import html as html_lib
 from io import BytesIO
 from datetime import date
@@ -44,6 +48,7 @@ st.set_page_config(page_title=APP_TITLE, page_icon=PAGE_ICON, layout="wide")
 APP_USERNAME = secret("APP_USERNAME")
 APP_PASSWORD = secret("APP_PASSWORD")
 LOGIN_CONFIGURED = bool(APP_USERNAME and APP_PASSWORD)
+AUTH_TOKEN_DAYS = 7   # how long a login survives browser refreshes
 
 PAGE_SIZE = 12
 DEBUG = False
@@ -54,6 +59,15 @@ MAX_WORKERS = 20
 # need fresher data; raise it to cut down on OneLake calls.
 DATA_TTL_SECONDS =  60 * 60 * 24 # 1 day
 DATA_FILTER_VERSION = 2
+
+# Images uploaded in the upload app are recorded in this SILVER table (one row
+# per lot: id, product_id, image_path, uploaded_at, uploaded_by). It is small,
+# so it is re-read far more often than the inventory: new uploads show up in
+# the report within this many seconds.
+APP_IMAGES_TTL_SECONDS = 5 * 60
+NO_IMAGE = "No image available"
+
+log = logging.getLogger("product_gallery")
 
 # ===========================================================
 # Fabric / OneLake connection details - read from Streamlit secrets.
@@ -107,6 +121,13 @@ def table_uri(lakehouse_id: str, schema: str, table: str) -> str:
         f"abfss://{workspace_id}@onelake.dfs.fabric.microsoft.com/"
         f"{lakehouse_id}/Tables/{schema}/{table}"
     )
+
+
+def app_images_table_name() -> str:
+    """Optional secret PRODUCT_IMAGE_OVERRIDES_TABLE (table in the Odoo schema
+    of the silver lakehouse); defaults to product_image_overrides."""
+    name = (secret("PRODUCT_IMAGE_OVERRIDES_TABLE") or "product_image_overrides").strip()
+    return name if name.replace("_", "").isalnum() else "product_image_overrides"
 
 
 def normalize_category_value(value) -> str:
@@ -674,22 +695,45 @@ def render_header():
         st.markdown(
             f"""
             <div class="brand-title">{html_lib.escape(APP_TITLE)}</div>
-            <div class="brand-subtitle">{html_lib.escape(APP_SUBTITLE)}</div>f
+            <div class="brand-subtitle">{html_lib.escape(APP_SUBTITLE)}</div>
             """,
             unsafe_allow_html=True,
         )
 
 
+def _auth_signing_key() -> bytes:
+    """Key for the signed login token in the URL. Set AUTH_SECRET in secrets to
+    control it; otherwise it is derived from the login, so changing the
+    password also logs everyone out."""
+    material = secret("AUTH_SECRET") or f"{APP_USERNAME}|{APP_PASSWORD}|{client_secret}"
+    return hashlib.sha256(material.encode("utf-8")).digest()
+
+
+def _make_auth_token() -> str:
+    expires = str(int(time.time()) + AUTH_TOKEN_DAYS * 24 * 3600)
+    signature = hmac.new(_auth_signing_key(), expires.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+    return f"{expires}.{signature}"
+
+
+def _auth_token_is_valid(token) -> bool:
+    """A plain ?auth=1 is no longer accepted: the token is signed and expires,
+    so it can't be typed into the URL to skip the login."""
+    try:
+        expires, signature = str(token).split(".")
+        expected = hmac.new(_auth_signing_key(), expires.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+        return hmac.compare_digest(signature, expected) and int(expires) > time.time()
+    except Exception:
+        return False
+
+
 def set_authenticated(value: bool):
-    """Keep login state across page reloads by using the URL query string.
-    The single-user app only needs a lightweight persistence mechanism; this
-    avoids prompting again after a browser refresh while the user remains in the
-    same authenticated session."""
+    """Keep login state across page reloads with a signed, expiring token in
+    the URL query string (?auth=...)."""
     st.session_state.authenticated = value
 
     try:
         if value:
-            st.query_params["auth"] = "1"
+            st.query_params["auth"] = _make_auth_token()
         elif "auth" in st.query_params:
             del st.query_params["auth"]
     except Exception:
@@ -703,7 +747,7 @@ def check_login() -> bool:
         return True
 
     try:
-        if st.query_params.get("auth") == "1":
+        if _auth_token_is_valid(st.query_params.get("auth")):
             st.session_state.authenticated = True
             return True
     except Exception:
@@ -727,7 +771,9 @@ def check_login() -> bool:
             submitted = st.form_submit_button("Login", width="stretch")
 
         if submitted:
-            if username == APP_USERNAME and password == APP_PASSWORD:
+            if hmac.compare_digest(username.encode("utf-8"), APP_USERNAME.encode("utf-8")) and hmac.compare_digest(
+                password.encode("utf-8"), APP_PASSWORD.encode("utf-8")
+            ):
                 set_authenticated(True)
                 st.rerun()
             else:
@@ -917,9 +963,9 @@ def build_inventory_df(data_filter_version: int = DATA_FILTER_VERSION) -> pd.Dat
         .alias("overall_age")
     )
 
-    # --- product_images (pi, Bronze) ---
-    # Same reasoning: dedupe on product_id so this join can't multiply rows.
-    # --- product_images (pi, Bronze) ---
+    # --- product_images (pi, Silver) ---
+    # Read from SILVER: bronze only holds the latest incremental load, so
+    # products whose images arrived in earlier loads would show "No image".
     # A single product_id can have multiple rows here, some with a real
     # image path and some blank/null (e.g. placeholder rows). Filtering
     # to valid images FIRST, then deduping, guarantees that if any valid
@@ -937,7 +983,7 @@ def build_inventory_df(data_filter_version: int = DATA_FILTER_VERSION) -> pd.Dat
         ["product_id"],
     ]
     product_images = _read_delta_lazy_fallback(
-        lakehouse_id_bronze, "Odoo", "product_images", image_candidates
+        lakehouse_id_silver, "Odoo", "product_images", image_candidates
     ).with_columns(
         pl.col("product_id").cast(pl.Utf8)
     )
@@ -971,7 +1017,7 @@ def build_inventory_df(data_filter_version: int = DATA_FILTER_VERSION) -> pd.Dat
         "company", "category", "vendor", "sku", "lot_number", "location",
         "product_name", "cp", "sp", "available_inventory",
         "available_selling_price", "product_id", "overall_age",
-        pl.col("image_1920").fill_null("No image available").alias("image_1920"),
+        pl.col("image_1920").fill_null(NO_IMAGE).alias("image_1920"),
     ])
 
     # Remove excluded records before the dataframe reaches the UI. This
@@ -1000,7 +1046,7 @@ def build_inventory_df(data_filter_version: int = DATA_FILTER_VERSION) -> pd.Dat
     # pandas boolean-mask filtering preserves row order, so a filtered
     # view is just a subset of this same ordering, not a re-sort.
     final = final.with_columns(
-        (pl.col("image_1920") == "No image available").alias("_no_image")
+        (pl.col("image_1920") == NO_IMAGE).alias("_no_image")
     ).sort(
         ["_no_image", "company", "category", "vendor", "sku", "lot_number"],
         nulls_last=True,
@@ -1018,6 +1064,62 @@ def build_inventory_df(data_filter_version: int = DATA_FILTER_VERSION) -> pd.Dat
             EXCLUDED_CATEGORY_PREFIX
         )
     ].reset_index(drop=True)
+
+
+# ===========================================================
+# Images uploaded in the app
+# The report shows coalesce(app image, Odoo image) per product: if a lot of
+# the product got an image in the upload app, the newest of those is shown,
+# otherwise the Odoo image (or "No image available"). The heavy inventory
+# above stays cached for a day; only this small table is re-read every
+# APP_IMAGES_TTL_SECONDS, so new uploads appear without rebuilding it.
+# ===========================================================
+@st.cache_data(ttl=APP_IMAGES_TTL_SECONDS, show_spinner=False)
+def load_app_image_paths() -> dict:
+    """{product_id (text): image path} - newest app upload per product.
+    Empty if the table doesn't exist yet or can't be read (the report then
+    simply shows the Odoo images)."""
+    try:
+        uploads = (
+            pl.scan_delta(
+                table_uri(lakehouse_id_silver, "Odoo", app_images_table_name()),
+                storage_options=storage_options,
+            )
+            .select(
+                pl.col("product_id").cast(pl.Utf8).str.strip_chars().alias("product_id"),
+                pl.col("image_path").cast(pl.Utf8).str.strip_chars().alias("image_path"),
+                pl.col("uploaded_at"),
+            )
+            .filter(
+                pl.col("product_id").is_not_null()
+                & (pl.col("product_id") != "")
+                & pl.col("image_path").str.starts_with("abfss://")
+            )
+            .sort("uploaded_at", nulls_last=False)
+            .unique(subset=["product_id"], keep="last")
+            .collect()
+        )
+    except Exception:
+        log.warning("Couldn't read the app image table; showing Odoo images only", exc_info=True)
+        return {}
+    return dict(zip(uploads["product_id"].to_list(), uploads["image_path"].to_list()))
+
+
+def apply_app_images(df: pd.DataFrame) -> pd.DataFrame:
+    """image_1920 = app image where the product has one, else the Odoo image.
+    Keeps "products with images first", so a product that only got its image
+    in the app moves up with the others (the rest of the order is unchanged)."""
+    paths = load_app_image_paths()
+    if not paths:
+        return df
+    product_ids = df["product_id"].astype(str).str.strip()
+    mask = product_ids.isin(paths.keys())
+    if not mask.any():
+        return df
+    df = df.copy()
+    df.loc[mask, "image_1920"] = product_ids[mask].map(paths)
+    no_image = (df["image_1920"] == NO_IMAGE).to_numpy()
+    return df.iloc[no_image.argsort(kind="stable")].reset_index(drop=True)
 
 
 # ===========================================================
@@ -1050,7 +1152,7 @@ def apply_filters(df, f):
     if f["in_stock_only"]:
         out = out[out["available_inventory"].fillna(0) > 0]
     if f["without_images"]:
-        out = out[out["image_1920"] == "No image available"]
+        out = out[out["image_1920"] == NO_IMAGE]
     return out
 
 
@@ -1374,7 +1476,7 @@ def main():
 
     try:
         with st.spinner("Loading your product gallery..."):
-            full_df = build_inventory_df(DATA_FILTER_VERSION)
+            full_df = apply_app_images(build_inventory_df(DATA_FILTER_VERSION))
     except Exception as e:
         st.error(f"Failed to connect / fetch data: {e}")
         return
