@@ -8,6 +8,7 @@ import base64
 import hashlib
 import hmac
 import logging
+import threading
 import time
 import html as html_lib
 from io import BytesIO
@@ -53,6 +54,7 @@ AUTH_TOKEN_DAYS = 7   # how long a login survives browser refreshes
 PAGE_SIZE = 12
 DEBUG = False
 MAX_WORKERS = 20
+CARD_IMAGE_MAX_PX = 720   # card thumbnails sent to the browser; originals stay untouched in OneLake
 
 # How long cached data/images stay valid before being refetched from
 # OneLake automatically. Lower this (e.g. 60 * 60 for hourly) if you
@@ -66,6 +68,12 @@ DATA_FILTER_VERSION = 2
 # the report within this many seconds.
 APP_IMAGES_TTL_SECONDS = 5 * 60
 NO_IMAGE = "No image available"
+
+# A background thread keeps the data loaded (see start_background_warmup):
+# it loads it on the first visit (while the login page is open) and checks
+# again this often, so the daily rebuild usually happens before anyone waits.
+WARMUP_EVERY_SECONDS = 5 * 60
+WARMUP_PREFETCH_PAGES = 2          # first gallery pages whose images are pre-loaded
 
 log = logging.getLogger("product_gallery")
 
@@ -783,9 +791,13 @@ def check_login() -> bool:
 
 
 # ===========================================================
-# Azure Data Lake client (for fetching image bytes) - created fresh
-# each time, no cache_resource, to avoid stale/expired credentials.
+# Azure Data Lake client (for fetching image bytes). One credential and
+# client are shared by all sessions: the credential renews its token by
+# itself before it expires, and the client keeps HTTPS connections open, so
+# image downloads skip a fresh sign-in and TLS handshake on every rerun.
+# (After rotating FABRIC_CLIENT_SECRET, reboot the app.)
 # ===========================================================
+@st.cache_resource(show_spinner=False)
 def get_datalake_service_client():
     credential = ClientSecretCredential(tenant_id, client_id, client_secret)
     return DataLakeServiceClient(
@@ -834,11 +846,34 @@ def load_image(client, image_ref: str):
         return None, image_bytes, f"{type(e).__name__}: {e}"
 
 
-@st.cache_data(ttl=DATA_TTL_SECONDS, show_spinner=False)
+def card_image_data_uri(img: Image.Image) -> str:
+    """Small JPEG of the image for the card (longest side CARD_IMAGE_MAX_PX).
+    Cards used to embed the full-size original, so every page sent several MB
+    of base64 to the browser."""
+    thumb = img.copy()
+    thumb.thumbnail((CARD_IMAGE_MAX_PX, CARD_IMAGE_MAX_PX))
+    if thumb.mode in ("RGBA", "LA") or (thumb.mode == "P" and "transparency" in thumb.info):
+        rgba = thumb.convert("RGBA")
+        thumb = Image.new("RGB", rgba.size, (255, 255, 255))
+        thumb.paste(rgba, mask=rgba.split()[-1])
+    buf = BytesIO()
+    thumb.convert("RGB").save(buf, format="JPEG", quality=85, optimize=True)
+    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+@st.cache_data(ttl=DATA_TTL_SECONDS, max_entries=3000, show_spinner=False)
 def load_image_cached(_client, image_ref):
     # Leading underscore on _client tells Streamlit not to try to hash
     # the client object (it isn't hashable / shouldn't be part of the key).
-    return load_image(_client, image_ref)
+    # Caches the finished card thumbnail (a ~30-60 KB string) instead of the
+    # decoded full-size image, which was unpickled and re-encoded on every rerun.
+    img, _raw, err = load_image(_client, image_ref)
+    if img is None:
+        return None, None, err
+    try:
+        return card_image_data_uri(img), None, None
+    except Exception as e:
+        return None, None, f"{type(e).__name__}: {e}"
 
 
 def load_images_parallel(client, refs):
@@ -856,11 +891,14 @@ def load_images_parallel(client, refs):
 # (much smaller) result set that Streamlit actually renders.
 # ===========================================================
 def _read_delta_lazy(lakehouse_id, schema, table, columns) -> pl.LazyFrame:
-    return pl.read_delta(
+    # scan_delta (lazy) instead of read_delta(...).lazy(): nothing is read
+    # until collect(), so only the needed columns are fetched and filters
+    # (e.g. stock_move_line's company/location) skip whole files and row
+    # groups instead of loading the full table into memory first.
+    return pl.scan_delta(
         table_uri(lakehouse_id, schema, table),
         storage_options=storage_options,
-        columns=columns,
-    ).lazy()
+    ).select(columns)
 
 
 def _read_delta_lazy_fallback(lakehouse_id, schema, table, candidates):
@@ -875,12 +913,16 @@ def _read_delta_lazy_fallback(lakehouse_id, schema, table, candidates):
     return _read_delta_lazy(lakehouse_id, schema, table, [])
 
 
-@st.cache_data(ttl=DATA_TTL_SECONDS, show_spinner="Loading product & inventory data...")
+# cache_resource (not cache_data): every rerun gets the same in-memory
+# dataframe instead of a freshly unpickled copy of the whole inventory, which
+# was a big part of the time each click took. The result must be treated as
+# READ-ONLY - code that changes it works on a copy (see apply_app_images).
+@st.cache_resource(ttl=DATA_TTL_SECONDS, max_entries=1, show_spinner="Loading product & inventory data...")
 def build_inventory_df(data_filter_version: int = DATA_FILTER_VERSION) -> pd.DataFrame:
     """Cached across all users of this deployed app for DATA_TTL_SECONDS.
-    After the TTL expires, the next page load re-fetches from OneLake and
-    picks up any new/changed rows. Use the Refresh button for an immediate
-    update instead of waiting on the TTL."""
+    After the TTL expires, the next load re-fetches from OneLake and picks up
+    any new/changed rows (the background warm-up usually does this first)."""
+    started = time.perf_counter()
     # --- product_product (p) ---
     product_product = _read_delta_lazy(
         lakehouse_id_silver, "Odoo", "product_product",
@@ -1047,13 +1089,16 @@ def build_inventory_df(data_filter_version: int = DATA_FILTER_VERSION) -> pd.Dat
     # matters on a machine with limited RAM once the underlying tables
     # get large, since it avoids single huge allocations.
     final_df = final.collect(engine="streaming").to_pandas()
-    return final_df.loc[
+    final_df = final_df.loc[
         ~final_df["company"].isin(EXCLUDED_COMPANIES)
         & ~final_df["location"].map(location_is_excluded)
         & ~final_df["category"].fillna("").astype(str).str.strip().str.upper().str.startswith(
             EXCLUDED_CATEGORY_PREFIX
         )
     ].reset_index(drop=True)
+    final_df.attrs["build_id"] = time.time_ns()     # cache key for the derived data below
+    log.info("inventory built: %d rows in %.1fs", len(final_df), time.perf_counter() - started)
+    return final_df
 
 
 # ===========================================================
@@ -1096,6 +1141,14 @@ def load_app_images() -> pd.DataFrame:
         log.warning("Couldn't read the app image table; showing Odoo images only", exc_info=True)
         return empty
     return uploads.to_pandas() if uploads.height else empty
+
+
+@st.cache_resource(ttl=APP_IMAGES_TTL_SECONDS, max_entries=1, show_spinner=False)
+def gallery_data(build_id: int, _base_df: pd.DataFrame) -> pd.DataFrame:
+    """The inventory with app images applied. Computed once per inventory
+    build and every APP_IMAGES_TTL_SECONDS (new uploads), shared by all
+    sessions instead of being redone on every click. READ-ONLY."""
+    return apply_app_images(_base_df)
 
 
 def apply_app_images(df: pd.DataFrame) -> pd.DataFrame:
@@ -1157,7 +1210,7 @@ def apply_filters(df, f):
 
 
 @st.cache_data(ttl=DATA_TTL_SECONDS, show_spinner=False)
-def compute_filter_options(df: pd.DataFrame) -> dict:
+def compute_filter_options(_df: pd.DataFrame, build_id: int) -> dict:
     """Precompute the option lists for every filter dropdown once, from
     the full base dataframe. Previously this work (including the
     category-hierarchy expansion, a Python-level loop) ran inline inside
@@ -1166,7 +1219,9 @@ def compute_filter_options(df: pd.DataFrame) -> dict:
     called once for the (CSS-hidden but still executed) desktop panel and
     again for the mobile panel. Cached here and computed once per data
     refresh, then shared by both panels - that's what made opening the
-    mobile filter drawer feel slow."""
+    mobile filter drawer feel slow. Keyed by build_id: hashing the whole
+    dataframe on every rerun (the old `df` argument) was itself slow."""
+    df = _df
 
     company_values = [
         value for value in sorted(df["company"].dropna().unique())
@@ -1418,7 +1473,9 @@ def image_to_data_uri(img: Image.Image) -> str:
 
 
 def render_card_html(item, img) -> str:
-    if img is not None:
+    if isinstance(img, str):                       # cached card thumbnail (data URI)
+        img_html = f'<img src="{img}" alt="" />'
+    elif img is not None:
         img_html = f'<img src="{image_to_data_uri(img)}" alt="" />'
     else:
         img_html = '<div class="product-card-noimg">No image<br>available</div>'
@@ -1456,10 +1513,52 @@ def render_card_html(item, img) -> str:
 
 
 # ===========================================================
+# Background warm-up
+# ===========================================================
+# The warm-up thread uses Streamlit's caches outside a page run, which makes
+# Streamlit log a harmless "missing ScriptRunContext" warning each time.
+logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
+
+
+def warm_caches_once():
+    """Loads what the first screen needs into the shared caches: inventory,
+    app images, filter options and the first pages' card images. Each step
+    is a cache hit when already loaded."""
+    base_df = build_inventory_df(DATA_FILTER_VERSION)
+    build_id = base_df.attrs.get("build_id", 0)
+    full_df = gallery_data(build_id, base_df)
+    compute_filter_options(base_df, build_id)
+    refs = full_df["image_1920"].iloc[:PAGE_SIZE * WARMUP_PREFETCH_PAGES].tolist()
+    if refs:
+        load_images_parallel(get_datalake_service_client(), refs)
+
+
+@st.cache_resource
+def start_background_warmup() -> bool:
+    """One warm-up thread per app process, started on the first visit (the
+    login page), so data loads while people sign in. It re-runs every
+    WARMUP_EVERY_SECONDS, so the daily rebuild and new app uploads are
+    usually picked up before a user has to wait for them."""
+    def loop():
+        while True:
+            try:
+                warm_caches_once()
+            except Exception:
+                log.warning("Background warm-up failed; data loads on first use instead", exc_info=True)
+            time.sleep(WARMUP_EVERY_SECONDS)
+
+    threading.Thread(target=loop, name="gallery-warmup", daemon=True).start()
+    return True
+
+
+# ===========================================================
 # Main
 # ===========================================================
 def main():
     inject_theme()
+
+    if not MISSING_CONFIG:
+        start_background_warmup()          # data loads while the user signs in
 
     if not check_login():
         return
@@ -1476,7 +1575,9 @@ def main():
 
     try:
         with st.spinner("Loading your product gallery..."):
-            full_df = apply_app_images(build_inventory_df(DATA_FILTER_VERSION))
+            base_df = build_inventory_df(DATA_FILTER_VERSION)
+            build_id = base_df.attrs.get("build_id", 0)
+            full_df = gallery_data(build_id, base_df)
     except Exception as e:
         st.error(f"Failed to connect / fetch data: {e}")
         return
@@ -1497,7 +1598,7 @@ def main():
 
     # Render exactly one filter layout at a time to keep the widget state
     # consistent and ensure the selected filters are applied once.
-    filter_options = compute_filter_options(full_df)
+    filter_options = compute_filter_options(base_df, build_id)
 
     if st.session_state.mobile_filters_open:
         filters = render_filters(full_df, filter_options, "mobile_filter_panel")
