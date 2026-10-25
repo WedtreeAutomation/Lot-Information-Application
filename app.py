@@ -964,53 +964,42 @@ def build_inventory_df(data_filter_version: int = DATA_FILTER_VERSION) -> pd.Dat
     )
 
     # --- product_images (pi, Silver) ---
-    # Read from SILVER: bronze only holds the latest incremental load, so
-    # products whose images arrived in earlier loads would show "No image".
-    # A single product_id can have multiple rows here, some with a real
-    # image path and some blank/null (e.g. placeholder rows). Filtering
-    # to valid images FIRST, then deduping, guarantees that if any valid
-    # image exists for a product it's the one kept - doing it in the
-    # opposite order risks .unique(keep="first") locking in a blank row
-    # before the real image ever gets a chance to survive.
-    image_columns = ["image_1920"]
-    image_candidates = [
-        ["product_id", "image_1920"],
-        # ["product_id", "image_1920", "image_1024"],
-        # ["product_id", "image_1920", "image_1024", "image_512"],
-        # ["product_id", "image_1920", "image_1024", "image_512", "image"],
-        # ["product_id", "image_1920", "image", "image_url", "image_link"],
-        # ["product_id", "image_1920", "image_url", "image_link"],
-        ["product_id"],
-    ]
-    product_images = _read_delta_lazy_fallback(
-        lakehouse_id_silver, "Odoo", "product_images", image_candidates
+    # One row per Odoo lot (stock.lot): `name` is the lot number. Images are
+    # matched PER LOT - each stock row gets the image of its own lot
+    # (same product_id + lot number), never another lot's image of the same
+    # product. A lot without an image shows "No image available".
+    # Read from SILVER: bronze only holds the latest incremental load.
+    product_images = _read_delta_lazy(
+        lakehouse_id_silver, "Odoo", "product_images",
+        columns=["id", "name", "product_id", "image_1920"],
+    ).select(
+        pl.col("id").cast(pl.Utf8).str.strip_chars().alias("pi_id"),
+        pl.col("product_id").cast(pl.Utf8).str.strip_chars().alias("product_id"),
+        pl.col("name").cast(pl.Utf8).str.strip_chars().str.to_uppercase().alias("_lot_key"),
+        pl.col("image_1920").cast(pl.Utf8).str.strip_chars().alias("image_1920"),
+    ).filter(
+        pl.col("pi_id").is_not_null() & pl.col("_lot_key").is_not_null() & (pl.col("_lot_key") != "")
     ).with_columns(
-        pl.col("product_id").cast(pl.Utf8)
+        pl.when(
+            pl.col("image_1920").is_null()
+            | pl.col("image_1920").str.to_lowercase().is_in(["", "false", "none", "null"])
+        ).then(None).otherwise(pl.col("image_1920")).alias("image_1920")
     )
 
-    available_image_columns = [col for col in image_columns if col in product_images.columns]
-    if not available_image_columns:
-        product_images = product_images.with_columns(
-            pl.lit(None).cast(pl.Utf8).alias("image_1920")
-        )
-    else:
-        product_images = product_images.with_columns(
-            pl.coalesce([
-                pl.col(col).cast(pl.Utf8, strict=False) for col in available_image_columns
-            ]).alias("image_1920")
-        )
+    # A lot can have more than one row (e.g. one per company). Keep one image
+    # per lot (a real one if any row has it) and ALL its row ids, so an app
+    # upload made against any of those rows is found (see apply_app_images).
+    lot_images = product_images.group_by(["product_id", "_lot_key"]).agg(
+        pl.col("image_1920").drop_nulls().first().alias("image_1920"),
+        pl.col("pi_id").unique().sort().str.join(",").alias("pi_ids"),
+    )
 
-    product_images = product_images.filter(
-        pl.col("image_1920").is_not_null()
-        & (pl.col("image_1920") != "")
-        & (pl.col("image_1920") != "False")
-    ).unique(subset=["product_id"], keep="first")
-
-    # Keep all products even when no image exists. The UI renders a
+    # Keep all stock rows even when the lot has no image. The UI renders a
     # "No image available" placeholder instead of dropping the row.
-    final = inventory.join(
-        product_images, on="product_id",
-        how="left", suffix="_img",
+    final = inventory.with_columns(
+        pl.col("lot_number").cast(pl.Utf8).str.strip_chars().str.to_uppercase().alias("_lot_key")
+    ).join(
+        lot_images, on=["product_id", "_lot_key"], how="left",
     )
 
     final = final.select([
@@ -1018,6 +1007,7 @@ def build_inventory_df(data_filter_version: int = DATA_FILTER_VERSION) -> pd.Dat
         "product_name", "cp", "sp", "available_inventory",
         "available_selling_price", "product_id", "overall_age",
         pl.col("image_1920").fill_null(NO_IMAGE).alias("image_1920"),
+        pl.col("pi_ids").fill_null(""),
     ])
 
     # Remove excluded records before the dataframe reaches the UI. This
@@ -1068,17 +1058,20 @@ def build_inventory_df(data_filter_version: int = DATA_FILTER_VERSION) -> pd.Dat
 
 # ===========================================================
 # Images uploaded in the app
-# The report shows coalesce(app image, Odoo image) per product: if a lot of
-# the product got an image in the upload app, the newest of those is shown,
-# otherwise the Odoo image (or "No image available"). The heavy inventory
-# above stays cached for a day; only this small table is re-read every
-# APP_IMAGES_TTL_SECONDS, so new uploads appear without rebuilding it.
+# The report shows coalesce(app image, Odoo image) PER LOT: if the lot got an
+# image in the upload app, that is shown, otherwise the lot's own Odoo image
+# (or "No image available"). Uploads are matched on the lot's product_images
+# id. The heavy inventory above stays cached for a day; only this small table
+# is re-read every APP_IMAGES_TTL_SECONDS, so new uploads appear without
+# rebuilding it.
 # ===========================================================
 @st.cache_data(ttl=APP_IMAGES_TTL_SECONDS, show_spinner=False)
-def load_app_image_paths() -> dict:
-    """{product_id (text): image path} - newest app upload per product.
+def load_app_images() -> pd.DataFrame:
+    """Newest app upload per lot: columns pi_id (text), image_path, uploaded_at.
     Empty if the table doesn't exist yet or can't be read (the report then
     simply shows the Odoo images)."""
+    empty = pd.DataFrame({"pi_id": pd.Series(dtype=str), "image_path": pd.Series(dtype=str),
+                          "uploaded_at": pd.Series(dtype="datetime64[ns, UTC]")})
     try:
         uploads = (
             pl.scan_delta(
@@ -1086,38 +1079,45 @@ def load_app_image_paths() -> dict:
                 storage_options=storage_options,
             )
             .select(
-                pl.col("product_id").cast(pl.Utf8).str.strip_chars().alias("product_id"),
+                pl.col("id").cast(pl.Utf8).str.strip_chars().alias("pi_id"),
                 pl.col("image_path").cast(pl.Utf8).str.strip_chars().alias("image_path"),
                 pl.col("uploaded_at"),
             )
             .filter(
-                pl.col("product_id").is_not_null()
-                & (pl.col("product_id") != "")
+                pl.col("pi_id").is_not_null()
+                & (pl.col("pi_id") != "")
                 & pl.col("image_path").str.starts_with("abfss://")
             )
             .sort("uploaded_at", nulls_last=False)
-            .unique(subset=["product_id"], keep="last")
+            .unique(subset=["pi_id"], keep="last")
             .collect()
         )
     except Exception:
         log.warning("Couldn't read the app image table; showing Odoo images only", exc_info=True)
-        return {}
-    return dict(zip(uploads["product_id"].to_list(), uploads["image_path"].to_list()))
+        return empty
+    return uploads.to_pandas() if uploads.height else empty
 
 
 def apply_app_images(df: pd.DataFrame) -> pd.DataFrame:
-    """image_1920 = app image where the product has one, else the Odoo image.
-    Keeps "products with images first", so a product that only got its image
-    in the app moves up with the others (the rest of the order is unchanged)."""
-    paths = load_app_image_paths()
-    if not paths:
+    """image_1920 = the lot's app image where it has one, else its Odoo image.
+    Keeps "products with images first", so a lot that only got its image in
+    the app moves up with the others (the rest of the order is unchanged)."""
+    uploads = load_app_images()
+    if uploads.empty or "pi_ids" not in df.columns:
         return df
-    product_ids = df["product_id"].astype(str).str.strip()
-    mask = product_ids.isin(paths.keys())
-    if not mask.any():
+    # Each stock row lists its lot's product_images ids ("123" or "123,456").
+    row_ids = df["pi_ids"].astype(str).str.split(",").explode()
+    row_ids = row_ids[row_ids.isin(set(uploads["pi_id"]))]
+    if row_ids.empty:
         return df
+    matches = (
+        pd.DataFrame({"row": row_ids.index, "pi_id": row_ids.to_numpy()})
+        .merge(uploads, on="pi_id", how="inner")
+        .sort_values("uploaded_at", kind="stable")
+        .drop_duplicates("row", keep="last")         # newest upload if several rows of the lot have one
+    )
     df = df.copy()
-    df.loc[mask, "image_1920"] = product_ids[mask].map(paths)
+    df.loc[matches["row"].to_numpy(), "image_1920"] = matches["image_path"].to_numpy()
     no_image = (df["image_1920"] == NO_IMAGE).to_numpy()
     return df.iloc[no_image.argsort(kind="stable")].reset_index(drop=True)
 
