@@ -10,18 +10,26 @@ import hmac
 import logging
 import threading
 import time
+import warnings
 import html as html_lib
 from io import BytesIO
 from datetime import date
+from dataclasses import dataclass, replace
 from urllib.parse import urlparse
-from concurrent.futures import ThreadPoolExecutor
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout, wait as wait_futures
 
 import pandas as pd
 import polars as pl
 import streamlit as st
+from streamlit.errors import StreamlitAPIException
 from PIL import Image
 from azure.identity import ClientSecretCredential
-from azure.storage.filedatalake import DataLakeServiceClient
+from azure.core.exceptions import ResourceNotFoundError
+from azure.core.pipeline.transport import RequestsTransport
+from azure.storage.filedatalake import ContentSettings, DataLakeServiceClient, ExponentialRetry
+import requests
+import requests.adapters
 
 # ===========================================================
 # Safe secrets access - st.secrets.get() still raises
@@ -34,6 +42,11 @@ def secret(key: str, default: str = "") -> str:
         return st.secrets.get(key, default)
     except Exception:
         return default
+
+
+def _safe_identifier(name, default: str = "") -> str:
+    name = (name or "").strip()
+    return name if name and name.replace("_", "").isalnum() else default
 
 
 # ===========================================================
@@ -54,28 +67,51 @@ AUTH_TOKEN_DAYS = 7   # how long a login survives browser refreshes
 PAGE_SIZE = 12
 DEBUG = False
 MAX_WORKERS = 20
-CARD_IMAGE_MAX_PX = 720   # card thumbnails sent to the browser; originals stay untouched in OneLake
+CARD_IMAGE_MAX_PX = 600   # card thumbnails sent to the browser; originals stay untouched in OneLake
+THUMB_DIR = "_gallery_thumbnails"   # saved thumbnails: <lakehouse>/Files/_gallery_thumbnails/w600/...
+IMAGE_CACHE_ENTRIES = 2000          # thumbnails kept in memory (~40 KB each)
 
-# How long cached data/images stay valid before being refetched from
-# OneLake automatically. Lower this (e.g. 60 * 60 for hourly) if you
-# need fresher data; raise it to cut down on OneLake calls.
-DATA_TTL_SECONDS =  60 * 60 * 24 # 1 day
-DATA_FILTER_VERSION = 2
+# ---------------------------------------------------------------
+# Data freshness
+# ---------------------------------------------------------------
+# The inventory is built in a BACKGROUND thread and swapped in when ready
+# (stale-while-revalidate): users always get the last good copy instantly
+# and never wait for a rebuild. Only the very first load after the app
+# starts (e.g. Streamlit Cloud waking from sleep) has to wait.
+#
+# Rebuild triggers:
+#   * a source Delta table got a new version (checked every VERSION_CHECK_SECONDS),
+#     so the nightly ETL shows up within minutes instead of up to a day later;
+#   * DATA_TTL_SECONDS passed since the last build (safety net).
+DATA_TTL_SECONDS = 60 * 60 * 24        # 1 day
+VERSION_CHECK_SECONDS = 10 * 60        # how often to look for new table versions
+REFRESH_CHECK_SECONDS = 60             # background loop tick
 
 # Images uploaded in the upload app are recorded in this SILVER table (one row
 # per lot: id, product_id, image_path, uploaded_at, uploaded_by). It is small,
 # so it is re-read far more often than the inventory: new uploads show up in
 # the report within this many seconds.
 APP_IMAGES_TTL_SECONDS = 5 * 60
+APP_IMAGES_WAIT_SECONDS = 3         # first load waits at most this long for the uploads table
 NO_IMAGE = "No image available"
 
-# A background thread keeps the data loaded (see start_background_warmup):
-# it loads it on the first visit (while the login page is open) and checks
-# again this often, so the daily rebuild usually happens before anyone waits.
-WARMUP_EVERY_SECONDS = 5 * 60
 WARMUP_PREFETCH_PAGES = 2          # first gallery pages whose images are pre-loaded
+PAGE_IMAGE_WAIT_SECONDS = 4        # a page is drawn after at most this long; slower images fill in
+PENDING_IMAGE_MAX_WAIT_SECONDS = 60
+
+# Optional pre-joined table built in Fabric (see build_product_gallery_table.py).
+# When GALLERY_TABLE is set in secrets, the app reads that ONE small table
+# instead of joining five Odoo tables (incl. the large stock_move_line) itself.
+GALLERY_TABLE = _safe_identifier(secret("GALLERY_TABLE"))
+GALLERY_TABLE_SCHEMA = _safe_identifier(secret("GALLERY_TABLE_SCHEMA"), "Odoo")
 
 log = logging.getLogger("product_gallery")
+if not log.handlers:   # the script re-runs on every interaction; add the handler once
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s: %(message)s"))
+    log.addHandler(_handler)
+    log.setLevel(logging.INFO)
+    log.propagate = False
 
 # ===========================================================
 # Fabric / OneLake connection details - read from Streamlit secrets.
@@ -123,6 +159,11 @@ EXCLUDED_LOCATIONS = {
 EXCLUDED_LOCATION_SUBSTRING = "CONSUMABLE"
 EXCLUDED_CATEGORY_PREFIX = "ADMIN"
 
+ODOO_SOURCE_TABLES = (
+    "product_product", "product_template", "stock_quant_n1",
+    "stock_move_line", "product_images",
+)
+
 
 def table_uri(lakehouse_id: str, schema: str, table: str) -> str:
     return (
@@ -134,8 +175,7 @@ def table_uri(lakehouse_id: str, schema: str, table: str) -> str:
 def app_images_table_name() -> str:
     """Optional secret PRODUCT_IMAGE_OVERRIDES_TABLE (table in the Odoo schema
     of the silver lakehouse); defaults to product_image_overrides."""
-    name = (secret("PRODUCT_IMAGE_OVERRIDES_TABLE") or "product_image_overrides").strip()
-    return name if name.replace("_", "").isalnum() else "product_image_overrides"
+    return _safe_identifier(secret("PRODUCT_IMAGE_OVERRIDES_TABLE"), "product_image_overrides")
 
 
 def normalize_category_value(value) -> str:
@@ -159,19 +199,6 @@ def expand_category_hierarchy(raw_value):
         current.append(part)
         hierarchy.append(" / ".join(current))
     return hierarchy
-
-
-def category_matches_selected(category_value, selected_values):
-    category_value = normalize_category_value(category_value)
-    if not category_value:
-        return False
-    for selected in selected_values:
-        selected_value = normalize_category_value(selected)
-        if not selected_value:
-            continue
-        if category_value == selected_value or category_value.startswith(selected_value + " / "):
-            return True
-    return False
 
 
 def location_is_excluded(location) -> bool:
@@ -800,9 +827,16 @@ def check_login() -> bool:
 @st.cache_resource(show_spinner=False)
 def get_datalake_service_client():
     credential = ClientSecretCredential(tenant_id, client_id, client_secret)
+    # The SDK defaults (20 s to connect, 60 s to read, first retry after 15 s)
+    # let one hiccup hold a card image for 40 s+. Fail fast and retry quickly
+    # instead, and keep enough pooled connections for the parallel downloads.
+    session = requests.Session()
+    session.mount("https://", requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=MAX_WORKERS * 2))
     return DataLakeServiceClient(
         account_url="https://onelake.dfs.fabric.microsoft.com",
         credential=credential,
+        transport=RequestsTransport(session=session, connection_timeout=5, read_timeout=20),
+        retry_policy=ExponentialRetry(initial_backoff=1, increment_base=2, retry_total=3),
     )
 
 
@@ -813,121 +847,215 @@ def _parse_abfss_path(abfss_path: str):
     return filesystem, file_path
 
 
-def fetch_image_bytes(client, abfss_path: str):
+# ===========================================================
+# Card images
+# Every card shows a small JPEG thumbnail (longest side CARD_IMAGE_MAX_PX,
+# ~30-60 KB). Thumbnails come from the first of:
+#   1. memory (this app process)                        instant
+#   2. OneLake, saved next to the originals under       one small download;
+#      Files/_gallery_thumbnails/w<px>/<original path>.jpg  survives restarts
+#   3. the original image: full download + resize,      slow, but only once
+#      then saved to (2) for every later session        per image
+# A saved thumbnail is used only if it is newer than its original, so an
+# image replaced at the same path gets a fresh thumbnail automatically.
+# ===========================================================
+def _thumbnail_location(abfss_path: str):
     filesystem, file_path = _parse_abfss_path(abfss_path)
-    fs_client = client.get_file_system_client(filesystem)
-    file_client = fs_client.get_file_client(file_path)
-    downloader = file_client.download_file()
-    return downloader.readall()
+    lakehouse, sep, rest = file_path.partition("/Files/")
+    if not sep or not rest or rest.startswith(THUMB_DIR + "/"):
+        return None
+    return filesystem, f"{lakehouse}/Files/{THUMB_DIR}/w{CARD_IMAGE_MAX_PX}/{rest}.jpg"
 
 
-def load_image(client, image_ref: str):
-    """Returns (PIL.Image or None, raw_bytes or None, error_message or None). Never raises.
-    image_1920 is always an abfss:// path pointing at the image file on OneLake."""
-    if image_ref is None or (isinstance(image_ref, str) and image_ref in ("", "False")):
-        return None, None, "No image reference"
-
-    if not (isinstance(image_ref, str) and image_ref.startswith("abfss://")):
-        return None, None, f"Unexpected image reference format: {image_ref!r}"
-
-    try:
-        image_bytes = fetch_image_bytes(client, image_ref)
-    except Exception as e:
-        return None, None, f"{type(e).__name__}: {e}"
-
-    if not image_bytes:
-        return None, image_bytes, "Empty file (0 bytes)"
-
-    try:
-        img = Image.open(BytesIO(image_bytes))
-        img.load()
-        return img, image_bytes, None
-    except Exception as e:
-        return None, image_bytes, f"{type(e).__name__}: {e}"
+def _file_client(client, filesystem: str, path: str):
+    return client.get_file_system_client(filesystem).get_file_client(path)
 
 
-def card_image_data_uri(img: Image.Image) -> str:
-    """Small JPEG of the image for the card (longest side CARD_IMAGE_MAX_PX).
-    Cards used to embed the full-size original, so every page sent several MB
-    of base64 to the browser."""
-    thumb = img.copy()
-    thumb.thumbnail((CARD_IMAGE_MAX_PX, CARD_IMAGE_MAX_PX))
-    if thumb.mode in ("RGBA", "LA") or (thumb.mode == "P" and "transparency" in thumb.info):
-        rgba = thumb.convert("RGBA")
-        thumb = Image.new("RGB", rgba.size, (255, 255, 255))
-        thumb.paste(rgba, mask=rgba.split()[-1])
+def fetch_image_bytes(client, abfss_path: str):
+    return _file_client(client, *_parse_abfss_path(abfss_path)).download_file().readall()
+
+
+def make_thumbnail_jpeg(image_bytes: bytes) -> bytes:
+    img = Image.open(BytesIO(image_bytes))
+    if img.format == "JPEG":
+        # Decode straight at (about) the thumbnail size - several times faster
+        # than decoding the full 1920px image and shrinking it afterwards.
+        img.draft("RGB", (CARD_IMAGE_MAX_PX, CARD_IMAGE_MAX_PX))
+    img.thumbnail((CARD_IMAGE_MAX_PX, CARD_IMAGE_MAX_PX))
+    if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+        rgba = img.convert("RGBA")
+        img = Image.new("RGB", rgba.size, (255, 255, 255))
+        img.paste(rgba, mask=rgba.split()[-1])
     buf = BytesIO()
-    thumb.convert("RGB").save(buf, format="JPEG", quality=85, optimize=True)
-    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+    img.convert("RGB").save(buf, format="JPEG", quality=82, optimize=True)
+    return buf.getvalue()
 
 
-@st.cache_data(ttl=DATA_TTL_SECONDS, max_entries=3000, show_spinner=False)
-def load_image_cached(_client, image_ref):
-    # Leading underscore on _client tells Streamlit not to try to hash
-    # the client object (it isn't hashable / shouldn't be part of the key).
-    # Caches the finished card thumbnail (a ~30-60 KB string) instead of the
-    # decoded full-size image, which was unpickled and re-encoded on every rerun.
-    img, _raw, err = load_image(_client, image_ref)
-    if img is None:
-        return None, None, err
+def _jpeg_data_uri(jpeg: bytes) -> str:
+    return "data:image/jpeg;base64," + base64.b64encode(jpeg).decode("ascii")
+
+
+class _ImageStore:
+    """Shared by all sessions: in-memory thumbnails, downloads in progress
+    (so two sessions or the prefetcher never fetch the same image twice at
+    once) and the worker threads."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.cache = OrderedDict()      # ref -> (expires_at, (data_uri | None, error | None))
+        self.inflight = {}              # ref -> Future
+        self.pool = ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="card-img")
+        self.io_pool = ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="card-img-io")
+        self.can_save = True            # set False if OneLake refuses thumbnail writes
+
+
+@st.cache_resource(show_spinner=False)
+def image_store() -> _ImageStore:
+    return _ImageStore()
+
+
+def _save_thumbnail(store: _ImageStore, client, location, jpeg: bytes):
     try:
-        return card_image_data_uri(img), None, None
+        _file_client(client, *location).upload_data(
+            jpeg, overwrite=True, content_settings=ContentSettings(content_type="image/jpeg"),
+        )
     except Exception as e:
-        return None, None, f"{type(e).__name__}: {e}"
+        if getattr(e, "status_code", None) in (401, 403):
+            store.can_save = False
+            log.warning("Can't save thumbnails to OneLake (%s). They are kept in memory only, "
+                        "so each app restart re-downloads the originals.", type(e).__name__)
+        else:
+            log.info("thumbnail save failed: %s: %s", type(e).__name__, e)
 
 
-def load_images_parallel(client, refs):
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        results = list(ex.map(lambda r: load_image_cached(client, r), refs))
-    return results
+def _load_card_image(store: _ImageStore, client, ref: str):
+    """(data_uri, None) or (None, error). Never raises."""
+    started = time.perf_counter()
+    try:
+        filesystem, path = _parse_abfss_path(ref)
+        original = _file_client(client, filesystem, path)
+        location = _thumbnail_location(ref)
+
+        if location:
+            # Look up the original's date while the saved thumbnail downloads.
+            original_props = store.io_pool.submit(original.get_file_properties)
+            thumb_bytes = thumb_modified = None
+            try:
+                downloader = _file_client(client, *location).download_file()
+                thumb_bytes = downloader.readall()
+                thumb_modified = downloader.properties.last_modified
+            except ResourceNotFoundError:
+                pass                                  # not made yet
+            except Exception as e:
+                log.info("saved thumbnail unreadable (%s); using the original", type(e).__name__)
+            try:
+                original_modified = original_props.result().last_modified
+            except Exception:
+                original_modified = None
+            if thumb_bytes and thumb_modified and original_modified and thumb_modified >= original_modified:
+                return _jpeg_data_uri(thumb_bytes), None
+
+        raw = original.download_file().readall()
+        if not raw:
+            return None, "Empty file (0 bytes)"
+        jpeg = make_thumbnail_jpeg(raw)
+        if location and store.can_save:
+            store.io_pool.submit(_save_thumbnail, store, client, location, jpeg)
+        log.info("thumbnail made from original: %.1f MB -> %d KB in %.1fs",
+                 len(raw) / 1e6, len(jpeg) // 1024, time.perf_counter() - started)
+        return _jpeg_data_uri(jpeg), None
+    except Exception as e:
+        log.info("image load failed in %.1fs: %s: %s", time.perf_counter() - started, type(e).__name__, e)
+        return None, f"{type(e).__name__}: {e}"
+
+
+def _load_and_remember(store: _ImageStore, client, ref: str):
+    result = _load_card_image(store, client, ref)
+    # Failures are retried after a few minutes instead of on every rerun.
+    ttl = DATA_TTL_SECONDS if result[0] is not None else 5 * 60
+    with store.lock:
+        store.cache[ref] = (time.time() + ttl, result)
+        store.cache.move_to_end(ref)
+        while len(store.cache) > IMAGE_CACHE_ENTRIES:
+            store.cache.popitem(last=False)
+        store.inflight.pop(ref, None)
+    return result
+
+
+def _is_image_ref(ref) -> bool:
+    return isinstance(ref, str) and ref.startswith("abfss://")
+
+
+def request_card_images(refs):
+    """Starts loading every ref that isn't in memory yet. Returns
+    (ready: {ref: data_uri | None}, pending: {ref: Future})."""
+    store = image_store()
+    client = get_datalake_service_client()
+    now = time.time()
+    ready, pending = {}, {}
+    with store.lock:
+        for ref in dict.fromkeys(r for r in refs if _is_image_ref(r)):
+            hit = store.cache.get(ref)
+            if hit is not None and hit[0] > now:
+                store.cache.move_to_end(ref)
+                ready[ref] = hit[1][0]
+                continue
+            future = store.inflight.get(ref)
+            if future is None:
+                future = store.pool.submit(_load_and_remember, store, client, ref)
+                store.inflight[ref] = future
+            pending[ref] = future
+    return ready, pending
+
+
+def get_card_images(refs, timeout=None):
+    """({ref: data_uri | None}, {ref: Future still loading}). Waits up to
+    `timeout` seconds (None = until all are loaded)."""
+    ready, pending = request_card_images(refs)
+    if pending:
+        wait_futures(list(pending.values()), timeout=timeout)
+        for ref, future in list(pending.items()):
+            if future.done():
+                ready[ref] = future.result()[0]
+                del pending[ref]
+    return ready, pending
+
+
+def prefetch_images(refs):
+    """Start loading the thumbnails the user is likely to open next (the next
+    page) without blocking the current render."""
+    request_card_images(refs)
 
 
 # ===========================================================
-# Data loading - replicates the reference SQL as Polars lazy joins
-# over the underlying Delta tables. Polars handles large-table joins
-# with far less memory/time than pandas .merge(), which matters once
-# product_product / stock_quant_n1 get into the hundreds of thousands
-# of rows. We only convert to pandas at the very end, for the final
-# (much smaller) result set that Streamlit actually renders.
+# Data loading
 # ===========================================================
-def _read_delta_lazy(lakehouse_id, schema, table, columns) -> pl.LazyFrame:
-    # scan_delta (lazy) instead of read_delta(...).lazy(): nothing is read
-    # until collect(), so only the needed columns are fetched and filters
-    # (e.g. stock_move_line's company/location) skip whole files and row
-    # groups instead of loading the full table into memory first.
+def _scan(lakehouse_id, schema, table, columns) -> pl.LazyFrame:
+    # scan_delta (lazy): nothing is read until collect(), so only the needed
+    # columns are fetched and filters can skip files / row groups.
     return pl.scan_delta(
         table_uri(lakehouse_id, schema, table),
         storage_options=storage_options,
     ).select(columns)
 
 
-def _read_delta_lazy_fallback(lakehouse_id, schema, table, candidates):
-    last_error = None
-    for columns in candidates:
-        try:
-            return _read_delta_lazy(lakehouse_id, schema, table, columns)
-        except Exception as exc:
-            last_error = exc
-    if last_error is not None:
-        raise last_error
-    return _read_delta_lazy(lakehouse_id, schema, table, [])
+def _as_date(lf: pl.LazyFrame, column: str) -> pl.Expr:
+    """Column as a Date whether the Delta table stores it as a timestamp/date
+    or as text (Polars 2 no longer casts text to Date). Reads only the schema."""
+    dtype = lf.collect_schema()[column]
+    if dtype == pl.Utf8:
+        return pl.col(column).str.to_datetime(strict=False).dt.date()
+    return pl.col(column).cast(pl.Date, strict=False)
 
 
-# cache_resource (not cache_data): every rerun gets the same in-memory
-# dataframe instead of a freshly unpickled copy of the whole inventory, which
-# was a big part of the time each click took. The result must be treated as
-# READ-ONLY - code that changes it works on a copy (see apply_app_images).
-@st.cache_resource(ttl=DATA_TTL_SECONDS, max_entries=1, show_spinner="Loading product & inventory data...")
-def build_inventory_df(data_filter_version: int = DATA_FILTER_VERSION) -> pd.DataFrame:
-    """Cached across all users of this deployed app for DATA_TTL_SECONDS.
-    After the TTL expires, the next load re-fetches from OneLake and picks up
-    any new/changed rows (the background warm-up usually does this first)."""
-    started = time.perf_counter()
+def _inventory_plan_from_odoo() -> pl.LazyFrame:
+    """Replicates the reference SQL as Polars lazy joins over the Odoo silver
+    tables. Used when no pre-joined GALLERY_TABLE is configured."""
     # --- product_product (p) ---
-    product_product = _read_delta_lazy(
+    product_product = _scan(
         lakehouse_id_silver, "Odoo", "product_product",
-        columns=["id", "display_name", "categ_id_name", "tracking",
-                 "product_variant_id", "sku", "lst_price", "standard_price"],
+        ["id", "display_name", "categ_id_name", "product_variant_id",
+         "sku", "lst_price", "standard_price"],
     ).rename({
         "id": "product_id",
         "display_name": "product_name",
@@ -939,30 +1067,22 @@ def build_inventory_df(data_filter_version: int = DATA_FILTER_VERSION) -> pd.Dat
         pl.col("sku").cast(pl.Utf8),
     ])
 
-    # --- product_template (pt) ---
-    # .unique() guards against join-explosion: if this "lookup" table has
-    # more than one row per product_variant_id (duplicates, historical
-    # rows, etc.), a left join multiplies every matching row on the left
-    # by however many duplicates exist here - which is exactly the kind
-    # of thing that turns a modest join into an 18GB allocation.
-    product_template = _read_delta_lazy(
+    # --- product_template (pt) --- .unique() guards against join explosion
+    product_template = _scan(
         lakehouse_id_silver, "Odoo", "product_template",
-        columns=["product_variant_id", "vendor_id_name"],
+        ["product_variant_id", "vendor_id_name"],
     ).rename({"vendor_id_name": "vendor"}).unique(
         subset=["product_variant_id"], keep="first"
     )
 
-    product_base = product_product.join(
-        product_template, on="product_variant_id", how="left"
-    )
+    product_base = product_product.join(product_template, on="product_variant_id", how="left")
 
     # --- stock_quant_n1 (sq) ---
-    # NOTE: product_id here is the internal join key to product_base, not
-    # the SKU - the real sku now comes from product_product.sku (p.sku).
-    stock_quant = _read_delta_lazy(
+    # Company / location exclusions are applied HERE, before any join, so the
+    # joins only process rows that can reach the UI.
+    stock_quant = _scan(
         lakehouse_id_silver, "Odoo", "stock_quant_n1",
-        columns=["company_id_name", "product_id", "lot_id_name",
-                 "location_id_name", "quantity"],
+        ["company_id_name", "product_id", "lot_id_name", "location_id_name", "quantity"],
     ).rename({
         "lot_id_name": "lot_number",
         "location_id_name": "location",
@@ -970,50 +1090,39 @@ def build_inventory_df(data_filter_version: int = DATA_FILTER_VERSION) -> pd.Dat
     }).with_columns([
         pl.col("product_id").cast(pl.Utf8),
         pl.col("company_id_name").replace(COMPANY_LABELS).alias("company"),
-    ])
+    ]).filter(
+        ~pl.col("company").is_in(sorted(EXCLUDED_COMPANIES))
+        & ~pl.col("location").is_in(sorted(EXCLUDED_LOCATIONS))
+        & ~pl.col("location").cast(pl.Utf8).fill_null("").str.to_uppercase()
+            .str.contains(EXCLUDED_LOCATION_SUBSTRING, literal=True)
+    )
 
-    inventory = stock_quant.join(
-        product_base, on="product_id", how="left"
-    ).with_columns(
+    inventory = stock_quant.join(product_base, on="product_id", how="left").with_columns(
         (pl.col("available_inventory") * pl.col("sp")).alias("available_selling_price")
     )
 
-    # --- stock_min_date (first stock movement date, for "overall age") ---
-    stock_min_date = _read_delta_lazy(
+    # --- first stock movement date per product+lot (for "overall age") ---
+    move_lines = _scan(
         lakehouse_id_silver, "Odoo", "stock_move_line",
-        columns=["product_id", "lot_id_name", "date",
-                 "company_id_name", "location_id_name"],
-    ).filter(
+        ["product_id", "lot_id_name", "date", "company_id_name", "location_id_name"],
+    )
+    stock_min_date = move_lines.filter(
         (pl.col("company_id_name") == "Wedtree eStore Private Limited - HO")
         & (pl.col("location_id_name") == "Partners/Vendors")
-    ).with_columns([
+    ).select(
         pl.col("product_id").cast(pl.Utf8),
-        # strict=False: rows with an unparseable/blank date become null
-        # instead of failing the whole query.
-        pl.col("date").cast(pl.Date, strict=False),
-    ]).rename({
-        "lot_id_name": "lot_number",
-    }).group_by(["product_id", "lot_number"]).agg(
+        pl.col("lot_id_name").alias("lot_number"),
+        _as_date(move_lines, "date"),
+    ).group_by(["product_id", "lot_number"]).agg(
         pl.col("date").min().alias("stock_move_date")
     )
 
-    inventory = inventory.join(
-        stock_min_date, on=["product_id", "lot_number"], how="left"
-    ).with_columns(
-        (pl.lit(date.today()) - pl.col("stock_move_date"))
-        .dt.total_days()
-        .alias("overall_age")
-    )
+    inventory = inventory.join(stock_min_date, on=["product_id", "lot_number"], how="left")
 
-    # --- product_images (pi, Silver) ---
-    # One row per Odoo lot (stock.lot): `name` is the lot number. Images are
-    # matched PER LOT - each stock row gets the image of its own lot
-    # (same product_id + lot number), never another lot's image of the same
-    # product. A lot without an image shows "No image available".
-    # Read from SILVER: bronze only holds the latest incremental load.
-    product_images = _read_delta_lazy(
+    # --- product_images (silver): one image per lot, plus all its row ids ---
+    product_images = _scan(
         lakehouse_id_silver, "Odoo", "product_images",
-        columns=["id", "name", "product_id", "image_1920"],
+        ["id", "name", "product_id", "image_1920"],
     ).select(
         pl.col("id").cast(pl.Utf8).str.strip_chars().alias("pi_id"),
         pl.col("product_id").cast(pl.Utf8).str.strip_chars().alias("product_id"),
@@ -1028,89 +1137,131 @@ def build_inventory_df(data_filter_version: int = DATA_FILTER_VERSION) -> pd.Dat
         ).then(None).otherwise(pl.col("image_1920")).alias("image_1920")
     )
 
-    # A lot can have more than one row (e.g. one per company). Keep one image
-    # per lot (a real one if any row has it) and ALL its row ids, so an app
-    # upload made against any of those rows is found (see apply_app_images).
     lot_images = product_images.group_by(["product_id", "_lot_key"]).agg(
         pl.col("image_1920").drop_nulls().first().alias("image_1920"),
         pl.col("pi_id").unique().sort().str.join(",").alias("pi_ids"),
     )
 
-    # Keep all stock rows even when the lot has no image. The UI renders a
-    # "No image available" placeholder instead of dropping the row.
     final = inventory.with_columns(
         pl.col("lot_number").cast(pl.Utf8).str.strip_chars().str.to_uppercase().alias("_lot_key")
-    ).join(
-        lot_images, on=["product_id", "_lot_key"], how="left",
+    ).join(lot_images, on=["product_id", "_lot_key"], how="left")
+
+    # Category comes from the right side of a left join, so it can only be
+    # filtered after the join.
+    final = final.filter(
+        ~pl.col("category").cast(pl.Utf8).fill_null("").str.strip_chars()
+            .str.to_uppercase().str.starts_with(EXCLUDED_CATEGORY_PREFIX)
     )
 
-    final = final.select([
+    return final.select([
         "company", "category", "vendor", "sku", "lot_number", "location",
         "product_name", "cp", "sp", "available_inventory",
-        "available_selling_price", "product_id", "overall_age",
-        pl.col("image_1920").fill_null(NO_IMAGE).alias("image_1920"),
-        pl.col("pi_ids").fill_null(""),
+        "available_selling_price", "product_id", "stock_move_date",
+        "image_1920", "pi_ids",
     ])
 
-    # Remove excluded records before the dataframe reaches the UI. This
-    # keeps counts, pagination, searches, and all filter options based on
-    # the same dataset.
-    final = final.filter(
-        ~pl.col("company").is_in(EXCLUDED_COMPANIES)
-        & ~pl.col("location").is_in(EXCLUDED_LOCATIONS)
-        & ~pl.col("location")
-            .cast(pl.Utf8)
-            .fill_null("")
-            .str.to_uppercase()
-            .str.contains(EXCLUDED_LOCATION_SUBSTRING, literal=True)
-        & ~pl.col("category")
-            .cast(pl.Utf8)
-            .fill_null("")
-            .str.strip_chars()
-            .str.to_uppercase()
-            .str.starts_with(EXCLUDED_CATEGORY_PREFIX)
+
+def _inventory_plan_from_gold() -> pl.LazyFrame:
+    """Reads the pre-joined table written by build_product_gallery_table.py.
+    The exclusions are already applied there."""
+    return _scan(
+        lakehouse_id_silver, GALLERY_TABLE_SCHEMA, GALLERY_TABLE,
+        ["company", "category", "vendor", "sku", "lot_number", "location",
+         "product_name", "cp", "sp", "available_inventory",
+         "available_selling_price", "product_id", "stock_move_date",
+         "image_1920", "pi_ids"],
+    ).with_columns(
+        pl.col("product_id").cast(pl.Utf8),
+        pl.col("sku").cast(pl.Utf8),
     )
 
-    # Products with a real image should surface first, always - this is
-    # the PRIMARY sort key (evaluated before company/category/etc.), and
-    # it's baked into the base dataframe rather than applied later, so
-    # it holds no matter which filters (if any) get applied downstream:
-    # pandas boolean-mask filtering preserves row order, so a filtered
-    # view is just a subset of this same ordering, not a re-sort.
-    final = final.with_columns(
-        (pl.col("image_1920") == NO_IMAGE).alias("_no_image")
-    ).sort(
-        ["_no_image", "company", "category", "vendor", "sku", "lot_number"],
-        nulls_last=True,
-    ).drop("_no_image")
 
-    # .collect(engine="streaming") runs the whole lazy join plan in
-    # chunks rather than materializing everything in one block - this
-    # matters on a machine with limited RAM once the underlying tables
-    # get large, since it avoids single huge allocations.
-    final_df = final.collect(engine="streaming").to_pandas()
-    final_df = final_df.loc[
-        ~final_df["company"].isin(EXCLUDED_COMPANIES)
-        & ~final_df["location"].map(location_is_excluded)
-        & ~final_df["category"].fillna("").astype(str).str.strip().str.upper().str.startswith(
-            EXCLUDED_CATEGORY_PREFIX
+def _source_tables():
+    if GALLERY_TABLE:
+        return [(GALLERY_TABLE_SCHEMA, GALLERY_TABLE)]
+    return [("Odoo", name) for name in ODOO_SOURCE_TABLES]
+
+
+def delta_version(uri: str) -> int:
+    """Current Delta version of one table - reads only the transaction log."""
+    from deltalake import DeltaTable
+    # without_files skips loading the file list on deltalake 0.x; newer
+    # versions ignore it (with a DeprecationWarning) or don't accept it.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        try:
+            return DeltaTable(uri, storage_options=storage_options, without_files=True).version()
+        except TypeError:
+            return DeltaTable(uri, storage_options=storage_options).version()
+
+
+def source_version():
+    """Delta version of each source table. Returns None if it can't be read
+    (then only the TTL applies)."""
+    try:
+        return tuple(
+            delta_version(table_uri(lakehouse_id_silver, schema, table))
+            for schema, table in _source_tables()
         )
-    ].reset_index(drop=True)
-    final_df.attrs["build_id"] = time.time_ns()     # cache key for the derived data below
-    log.info("inventory built: %d rows in %.1fs", len(final_df), time.perf_counter() - started)
-    return final_df
+    except Exception:
+        log.warning("Couldn't read source table versions", exc_info=True)
+        return None
+
+
+def build_base_inventory() -> pd.DataFrame:
+    """Runs the query and returns the inventory, sorted "products with images
+    first", with helper columns the filters use (computed once here instead
+    of on every click)."""
+    started = time.perf_counter()
+    plan = _inventory_plan_from_gold() if GALLERY_TABLE else _inventory_plan_from_odoo()
+
+    plan = plan.with_columns(
+        pl.col("stock_move_date").cast(pl.Date, strict=False),
+        pl.col("image_1920").fill_null(NO_IMAGE),
+        pl.col("pi_ids").fill_null(""),
+    ).with_columns(
+        (pl.lit(date.today()) - pl.col("stock_move_date")).dt.total_days().alias("overall_age"),
+        (pl.col("image_1920") == NO_IMAGE).alias("_no_image"),
+        # Lower-cased search text, so a search is one vectorised .contains()
+        pl.concat_str(
+            [
+                pl.col("product_name").cast(pl.Utf8).fill_null("").str.to_lowercase(),
+                pl.col("sku").cast(pl.Utf8).fill_null("").str.to_lowercase(),
+            ],
+            separator="\n",
+        ).alias("_search"),
+        pl.col("lot_number").cast(pl.Utf8).fill_null("").str.to_lowercase().alias("_lot_lc"),
+    ).sort(
+        # Products with a real image always come first; filters keep this order.
+        # location is a final tie-breaker and maintain_order makes the sort
+        # stable, so the same data always gives the same pages.
+        ["_no_image", "company", "category", "vendor", "sku", "lot_number", "location"],
+        nulls_last=True,
+        maintain_order=True,
+    ).drop(["_no_image", "stock_move_date"])
+
+    df = plan.collect(engine="streaming").to_pandas()
+
+    # Normalised category for the category filter - computed per DISTINCT
+    # category (a few hundred), not per row.
+    categories = df["category"]
+    mapping = {value: normalize_category_value(value) for value in categories.dropna().unique()}
+    df["_cat_norm"] = categories.map(mapping).fillna("")
+
+    log.info(
+        "inventory built from %s: %d rows in %.1fs",
+        f"{GALLERY_TABLE_SCHEMA}.{GALLERY_TABLE}" if GALLERY_TABLE else "Odoo tables",
+        len(df), time.perf_counter() - started,
+    )
+    return df
 
 
 # ===========================================================
 # Images uploaded in the app
-# The report shows coalesce(app image, Odoo image) PER LOT: if the lot got an
-# image in the upload app, that is shown, otherwise the lot's own Odoo image
-# (or "No image available"). Uploads are matched on the lot's product_images
-# id. The heavy inventory above stays cached for a day; only this small table
-# is re-read every APP_IMAGES_TTL_SECONDS, so new uploads appear without
-# rebuilding it.
+# The report shows coalesce(app image, Odoo image) PER LOT. Uploads are
+# matched on the lot's product_images id. Only this small table is re-read
+# every APP_IMAGES_TTL_SECONDS, so new uploads appear without a rebuild.
 # ===========================================================
-@st.cache_data(ttl=APP_IMAGES_TTL_SECONDS, show_spinner=False)
 def load_app_images() -> pd.DataFrame:
     """Newest app upload per lot: columns pi_id (text), image_path, uploaded_at.
     Empty if the table doesn't exist yet or can't be read (the report then
@@ -1143,19 +1294,10 @@ def load_app_images() -> pd.DataFrame:
     return uploads.to_pandas() if uploads.height else empty
 
 
-@st.cache_resource(ttl=APP_IMAGES_TTL_SECONDS, max_entries=1, show_spinner=False)
-def gallery_data(build_id: int, _base_df: pd.DataFrame) -> pd.DataFrame:
-    """The inventory with app images applied. Computed once per inventory
-    build and every APP_IMAGES_TTL_SECONDS (new uploads), shared by all
-    sessions instead of being redone on every click. READ-ONLY."""
-    return apply_app_images(_base_df)
-
-
-def apply_app_images(df: pd.DataFrame) -> pd.DataFrame:
+def apply_app_images(df: pd.DataFrame, uploads: pd.DataFrame) -> pd.DataFrame:
     """image_1920 = the lot's app image where it has one, else its Odoo image.
     Keeps "products with images first", so a lot that only got its image in
     the app moves up with the others (the rest of the order is unchanged)."""
-    uploads = load_app_images()
     if uploads.empty or "pi_ids" not in df.columns:
         return df
     # Each stock row lists its lot's product_images ids ("123" or "123,456").
@@ -1175,65 +1317,24 @@ def apply_app_images(df: pd.DataFrame) -> pd.DataFrame:
     return df.iloc[no_image.argsort(kind="stable")].reset_index(drop=True)
 
 
-# ===========================================================
-# Filtering
-# ===========================================================
-def apply_filters(df, f):
-    out = df
-    if f["company"]:
-        out = out[out["company"].isin(f["company"])]
-    if f["category"]:
-        category_values = f["category"]
-        out = out[
-            out["category"].fillna("").map(
-                lambda value: category_matches_selected(value, category_values)
-            )
-        ]
-    if f["vendor"]:
-        out = out[out["vendor"].isin(f["vendor"])]
-    if f["location"]:
-        out = out[out["location"].isin(f["location"])]
-    if f["search"]:
-        needle = f["search"].strip().lower()
-        out = out[
-            out["product_name"].astype(str).str.lower().str.contains(needle, na=False)
-            | out["sku"].astype(str).str.lower().str.contains(needle, na=False)
-        ]
-    if f["lot_number"]:
-        needle = f["lot_number"].strip().lower()
-        out = out[out["lot_number"].astype(str).str.lower().str.contains(needle, na=False)]
-    if f["in_stock_only"]:
-        out = out[out["available_inventory"].fillna(0) > 0]
-    if f["without_images"]:
-        out = out[out["image_1920"] == NO_IMAGE]
-    return out
-
-
-@st.cache_data(ttl=DATA_TTL_SECONDS, show_spinner=False)
-def compute_filter_options(_df: pd.DataFrame, build_id: int) -> dict:
-    """Precompute the option lists for every filter dropdown once, from
-    the full base dataframe. Previously this work (including the
-    category-hierarchy expansion, a Python-level loop) ran inline inside
-    render_filters() on every single Streamlit rerun, AND ran a second
-    time whenever the mobile drawer was open, since render_filters() was
-    called once for the (CSS-hidden but still executed) desktop panel and
-    again for the mobile panel. Cached here and computed once per data
-    refresh, then shared by both panels - that's what made opening the
-    mobile filter drawer feel slow. Keyed by build_id: hashing the whole
-    dataframe on every rerun (the old `df` argument) was itself slow."""
-    df = _df
-
+def compute_filter_options(df: pd.DataFrame) -> dict:
+    """Option lists for every filter dropdown, computed once per data build
+    and shared by all sessions."""
     company_values = [
         value for value in sorted(df["company"].dropna().unique())
         if value not in EXCLUDED_COMPANIES
     ]
-    valid_locations = {
-        value for value in df["location"].dropna().unique()
-        if not location_is_excluded(value)
+
+    pairs = df[["company", "location"]].dropna(subset=["location"]).drop_duplicates()
+    pairs = pairs[~pairs["location"].map(location_is_excluded)]
+    location_by_company = {
+        company: sorted(group["location"].unique())
+        for company, group in pairs.dropna(subset=["company"]).groupby("company")
     }
+
     category_values = sorted({
         value
-        for raw in df["category"].dropna().tolist()
+        for raw in df["category"].dropna().unique()          # distinct values only
         for value in expand_category_hierarchy(raw)
         if not str(value).strip().upper().startswith(EXCLUDED_CATEGORY_PREFIX)
     })
@@ -1242,11 +1343,255 @@ def compute_filter_options(_df: pd.DataFrame, build_id: int) -> dict:
         "company": company_values,
         "category": category_values,
         "vendor": sorted(df["vendor"].dropna().unique()),
-        "location": sorted(valid_locations),
+        "location": sorted(pairs["location"].unique()),
+        "location_by_company": location_by_company,
     }
 
 
-def render_filters(df, options: dict, panel_key: str = "filter_panel") -> dict:
+# ===========================================================
+# Shared data snapshot (stale-while-revalidate)
+# ===========================================================
+@dataclass(frozen=True, eq=False)
+class GallerySnapshot:
+    df: pd.DataFrame          # inventory with app images applied - READ-ONLY
+    base_df: pd.DataFrame     # inventory as built from Fabric - READ-ONLY
+    options: dict
+    version: tuple            # source Delta versions the build was made from
+    built_at: float
+    images_at: float
+    checked_at: float
+
+
+class _DataStore:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.snapshot = None
+        # App-uploaded images are read on their own thread so a slow read of
+        # that table never holds up the gallery (see refresh_data).
+        self.uploads_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="app-images")
+        self.uploads_job = None          # Future of the read in progress
+        self.uploads_df = None           # last uploads table that was read
+        self.uploads_version = None      # its Delta version
+
+
+@st.cache_resource(show_spinner=False)
+def data_store() -> _DataStore:
+    # One store per app process, shared by every session and the background
+    # thread (module globals don't work: Streamlit re-executes this file on
+    # every rerun).
+    return _DataStore()
+
+
+def _timed(timings: dict, name: str, fn, *args):
+    """Runs fn(*args) and records how long it took (shown in the refresh log)."""
+    started = time.perf_counter()
+    try:
+        return fn(*args)
+    finally:
+        timings[name] = time.perf_counter() - started
+
+
+def _read_uploads(store: _DataStore):
+    """(uploads DataFrame, version, changed). Skips the read when the table's
+    Delta version is the same as last time."""
+    started = time.perf_counter()
+    try:
+        version = delta_version(table_uri(lakehouse_id_silver, "Odoo", app_images_table_name()))
+    except Exception:
+        version = None
+    if version is not None and version == store.uploads_version and store.uploads_df is not None:
+        return store.uploads_df, version, False
+    uploads = load_app_images()
+    log.info("app image table read: %d uploads in %.1fs", len(uploads), time.perf_counter() - started)
+    return uploads, version, True
+
+
+def _start_uploads_read(store: _DataStore):
+    if store.uploads_job is None:
+        store.uploads_job = store.uploads_pool.submit(_read_uploads, store)
+
+
+def _take_uploads(store: _DataStore, wait: float = 0):
+    """The finished uploads read as (DataFrame, changed), or None if it is
+    still running (waits up to `wait` seconds for it)."""
+    job = store.uploads_job
+    if job is None:
+        return None
+    try:
+        uploads, version, changed = job.result(timeout=wait)
+    except FutureTimeout:
+        return None
+    except Exception:
+        log.warning("App image table read failed", exc_info=True)
+        uploads, version, changed = store.uploads_df, store.uploads_version, False
+    store.uploads_job = None
+    if uploads is None:
+        return None
+    store.uploads_df, store.uploads_version = uploads, version
+    return uploads, changed
+
+
+def refresh_data() -> GallerySnapshot:
+    """Brings the shared snapshot up to date and returns it. Only one thread
+    rebuilds at a time; readers keep using the previous snapshot meanwhile."""
+    store = data_store()
+    with store.lock:
+        snap = store.snapshot
+        now = time.time()
+
+        inventory_due = snap is None or now - snap.built_at >= DATA_TTL_SECONDS
+        version = snap.version if snap is not None else None
+        checked_at = snap.checked_at if snap is not None else 0.0
+
+        if not inventory_due and now - checked_at >= VERSION_CHECK_SECONDS:
+            checked_at = now
+            latest = source_version()
+            if latest is not None and latest != snap.version:
+                log.info("source tables changed %s -> %s; rebuilding", snap.version, latest)
+                inventory_due = True
+
+        # App uploads: re-read every APP_IMAGES_TTL_SECONDS in the background;
+        # a finished read is applied on the next pass (at most a minute later).
+        if snap is None or now - snap.images_at >= APP_IMAGES_TTL_SECONDS:
+            _start_uploads_read(store)
+        taken = _take_uploads(store)
+
+        if not inventory_due and taken is None:
+            if snap.checked_at != checked_at:
+                store.snapshot = replace(snap, checked_at=checked_at)
+            return store.snapshot
+        if not inventory_due and not taken[1]:
+            # Uploads table unchanged: nothing to re-apply.
+            store.snapshot = replace(snap, images_at=now, checked_at=checked_at)
+            return store.snapshot
+
+        base_df = options = None
+        built_at = now
+        timings = {}
+        started = time.perf_counter()
+        if inventory_due:
+            # The version read runs alongside the build and starts with it, so
+            # if the ETL writes during the build the next check sees a newer
+            # version and rebuilds again.
+            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="gallery-version") as ex:
+                version_job = ex.submit(_timed, timings, "version check", source_version)
+                try:
+                    base_df = _timed(timings, "inventory", build_base_inventory)
+                    options = _timed(timings, "filter options", compute_filter_options, base_df)
+                    version = version_job.result() or ()
+                    checked_at = now
+                except Exception:
+                    if snap is None:
+                        raise
+                    log.warning("Inventory refresh failed; still serving the previous data", exc_info=True)
+            if taken is None and store.uploads_df is None:
+                # First load: give the uploads table a few more seconds, but
+                # never let it hold up the gallery.
+                taken = _timed(timings, "waiting for app image table", _take_uploads,
+                               store, APP_IMAGES_WAIT_SECONDS)
+        if base_df is None:
+            base_df, options, built_at = snap.base_df, snap.options, snap.built_at
+
+        if taken is not None:
+            uploads, images_at = taken[0], now
+        else:
+            uploads = store.uploads_df          # last known uploads (None on a cold start)
+            images_at = snap.images_at if snap is not None else 0.0
+            if uploads is None:
+                log.warning(
+                    "App image table is still loading; showing Odoo images until it is ready. "
+                    "If this keeps happening, compact the table (see build_product_gallery_table.py)."
+                )
+        df = (_timed(timings, "apply app images", apply_app_images, base_df, uploads)
+              if uploads is not None else base_df)
+        log.info(
+            "data refresh done in %.1fs (%s)", time.perf_counter() - started,
+            ", ".join(f"{name} {secs:.1f}s" for name, secs in timings.items()),
+        )
+        store.snapshot = GallerySnapshot(
+            df=df, base_df=base_df, options=options, version=version,
+            built_at=built_at, images_at=images_at, checked_at=checked_at,
+        )
+        return store.snapshot
+
+
+def get_snapshot() -> GallerySnapshot:
+    """Instant once anything is loaded; refreshes happen in the background."""
+    snap = data_store().snapshot
+    return snap if snap is not None else refresh_data()
+
+
+# The background thread uses Streamlit's caches outside a page run, which makes
+# Streamlit log a harmless "missing ScriptRunContext" warning each time.
+logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
+
+
+@st.cache_resource
+def start_background_refresh() -> bool:
+    """One refresh thread per app process, started on the first visit (the
+    login page), so data loads while people sign in and later rebuilds never
+    block a user."""
+    if GALLERY_TABLE:
+        log.info("data source: pre-joined table %s.%s", GALLERY_TABLE_SCHEMA, GALLERY_TABLE)
+    else:
+        log.warning(
+            "data source: GALLERY_TABLE is not set in secrets, so the app joins the five "
+            "Odoo tables itself (slow). Add GALLERY_TABLE = \"product_gallery_inventory\"."
+        )
+
+    def loop():
+        while True:
+            try:
+                snap = refresh_data()
+                refs = snap.df["image_1920"].iloc[:PAGE_SIZE * WARMUP_PREFETCH_PAGES].tolist()
+                if refs:
+                    get_card_images(refs)            # waits until loaded
+            except Exception:
+                log.warning("Background refresh failed; will retry", exc_info=True)
+            time.sleep(REFRESH_CHECK_SECONDS)
+
+    threading.Thread(target=loop, name="gallery-refresh", daemon=True).start()
+    return True
+
+
+# ===========================================================
+# Filtering (vectorised - no per-row Python functions)
+# ===========================================================
+FILTER_KEYS = ("company", "category", "vendor", "location", "search",
+               "lot_number", "in_stock_only", "without_images")
+
+
+def apply_filters(df, f):
+    mask = pd.Series(True, index=df.index)
+    if f["company"]:
+        mask &= df["company"].isin(f["company"])
+    if f["category"]:
+        selected = [s for s in (normalize_category_value(v) for v in f["category"]) if s]
+        category_mask = pd.Series(False, index=df.index)
+        if selected:
+            cat = df["_cat_norm"]
+            category_mask = cat.isin(selected)
+            for value in selected:      # a category also matches its sub-categories
+                category_mask |= cat.str.startswith(value + " / ")
+        mask &= category_mask
+    if f["vendor"]:
+        mask &= df["vendor"].isin(f["vendor"])
+    if f["location"]:
+        mask &= df["location"].isin(f["location"])
+    needle = (f["search"] or "").strip().lower()
+    if needle:
+        mask &= df["_search"].str.contains(needle, regex=False)
+    lot_needle = (f["lot_number"] or "").strip().lower()
+    if lot_needle:
+        mask &= df["_lot_lc"].str.contains(lot_needle, regex=False)
+    if f["in_stock_only"]:
+        mask &= df["available_inventory"].fillna(0) > 0
+    if f["without_images"]:
+        mask &= df["image_1920"] == NO_IMAGE
+    return df[mask]
+
+
+def render_filters(options: dict, panel_key: str = "filter_panel") -> dict:
     filter_state = st.session_state.setdefault("filter_state", {
         "company": [],
         "category": [],
@@ -1261,10 +1606,6 @@ def render_filters(df, options: dict, panel_key: str = "filter_panel") -> dict:
 
     with st.container(key=panel_key):
         if panel_key == "mobile_filter_panel":
-            # Top-right X, inline with the "Filters" heading - the
-            # standard placement for dismissing a slide-in panel in most
-            # mobile apps, rather than a separate full-width button
-            # floating above the heading.
             head_col, close_col = st.columns([5, 1])
             with head_col:
                 st.markdown("<h3>Filters</h3>", unsafe_allow_html=True)
@@ -1278,38 +1619,27 @@ def render_filters(df, options: dict, panel_key: str = "filter_panel") -> dict:
         company = st.multiselect(
             "Company",
             options["company"],
-            default=filter_state.get("company", []),
+            default=[v for v in filter_state.get("company", []) if v in options["company"]],
             key="filters_company",
         )
         filter_state["company"] = company
 
         # --- Category with shortened display labels ---
         category_options = options["category"]
-        
-        # Create display labels: show last 2-3 parts of the path, or
-        # truncate to a reasonable length
+
         def make_display_label(full_path):
             if not full_path:
                 return full_path
             parts = full_path.split(" / ")
             if len(parts) <= 2:
                 return full_path
-            # Show last 2 parts with ellipsis
             return "… / " + " / ".join(parts[-2:])
-        
-        # Build mapping from full path to display label
+
         display_map = {cat: make_display_label(cat) for cat in category_options}
-        
-        # Create options with display labels
         display_options = [display_map[cat] for cat in category_options]
-        
-        # Get currently selected values (full paths)
         current_selected = filter_state.get("category", [])
-        
-        # Map selected full paths to display labels for the widget
         selected_display = [display_map.get(cat, cat) for cat in current_selected if cat in display_map]
-        
-        # Create a custom multiselect using format_func
+
         selected_display_labels = st.multiselect(
             "Category",
             display_options,
@@ -1317,57 +1647,38 @@ def render_filters(df, options: dict, panel_key: str = "filter_panel") -> dict:
             key=f"filters_category_{panel_key}",
             format_func=lambda x: x,
         )
-        
-        # Convert selected display labels back to full paths
-        # Find which full paths match the selected display labels
+
         reverse_map = {}
         for full_path, display_label in display_map.items():
-            if display_label not in reverse_map:
-                reverse_map[display_label] = []
-            reverse_map[display_label].append(full_path)
-        
+            reverse_map.setdefault(display_label, []).append(full_path)
+
         selected_full_paths = []
         for display_label in selected_display_labels:
-            # If multiple full paths share the same display label, 
-            # select the first one (shouldn't happen with our mapping)
             matches = reverse_map.get(display_label, [])
             if matches:
                 selected_full_paths.append(matches[0])
-            else:
-                # Fallback: try to find by display_label as full path
-                if display_label in category_options:
-                    selected_full_paths.append(display_label)
-        
-        # Preserve any selected values that might not match display labels
-        # (for backward compatibility)
+            elif display_label in category_options:
+                selected_full_paths.append(display_label)
+
         for cat in current_selected:
-            if cat not in selected_full_paths and cat in category_options:
-                # Check if this category's display label is selected
-                if display_map.get(cat) in selected_display_labels:
-                    pass  # Already handled
-                elif display_map.get(cat) not in selected_display_labels:
-                    # Only add if not already there
-                    selected_full_paths.append(cat)
-        
-        # Remove duplicates
+            if (cat not in selected_full_paths and cat in category_options
+                    and display_map.get(cat) not in selected_display_labels):
+                selected_full_paths.append(cat)
+
         selected_full_paths = list(dict.fromkeys(selected_full_paths))
         filter_state["category"] = selected_full_paths
 
         vendor = st.multiselect(
             "Vendor",
             options["vendor"],
-            default=filter_state.get("vendor", []),
+            default=[v for v in filter_state.get("vendor", []) if v in options["vendor"]],
             key="filters_vendor",
         )
         filter_state["vendor"] = vendor
 
         if company:
-            location_options = [
-                value for value in sorted(
-                    df.loc[df["company"].isin(company), "location"].dropna().unique()
-                )
-                if not location_is_excluded(value)
-            ]
+            by_company = options["location_by_company"]
+            location_options = sorted(set().union(*(by_company.get(c, []) for c in company)))
         else:
             location_options = options["location"]
         filter_state["location"] = [
@@ -1401,7 +1712,6 @@ def render_filters(df, options: dict, panel_key: str = "filter_panel") -> dict:
             key="filters_without_images",
         )
         filter_state["without_images"] = without_images
-        price_range = None
 
         cols_per_row = st.slider(
             "Columns per row",
@@ -1415,15 +1725,6 @@ def render_filters(df, options: dict, panel_key: str = "filter_panel") -> dict:
         st.markdown("<br>", unsafe_allow_html=True)
 
         if panel_key == "mobile_filter_panel":
-            # "Apply Filters" - the explicit commit-and-close action a
-            # mobile filter drawer is expected to have, in the spot the
-            # old Refresh button used to occupy. Every filter widget
-            # above already writes into filter_state / session_state as
-            # soon as it's touched, so there's nothing extra to compute
-            # here - this button's job is purely to close the drawer and
-            # reveal the (already updated) results, which is what
-            # "Apply" means from the person's point of view. The X at
-            # the top is a plain dismiss for the same underlying state.
             if st.button("✅ Apply Filters", key="mobile_filter_apply", width="stretch"):
                 st.session_state.mobile_filters_open = False
                 st.rerun()
@@ -1441,9 +1742,19 @@ def render_filters(df, options: dict, panel_key: str = "filter_panel") -> dict:
         "lot_number": lot_number,
         "in_stock_only": in_stock_only,
         "without_images": without_images,
-        "price_range": price_range,
         "cols_per_row": cols_per_row,
     }
+
+
+def reset_page_if_filters_changed(filters: dict):
+    """Go back to page 1 when the filters change (not on paging/column changes)."""
+    key = tuple(
+        tuple(filters[k]) if isinstance(filters[k], list) else filters[k]
+        for k in FILTER_KEYS
+    )
+    if st.session_state.get("_filter_key") != key:
+        st.session_state._filter_key = key
+        st.session_state.page = 1
 
 
 # ===========================================================
@@ -1472,11 +1783,13 @@ def image_to_data_uri(img: Image.Image) -> str:
     return f"data:image/{fmt.lower()};base64,{b64}"
 
 
-def render_card_html(item, img) -> str:
+def render_card_html(item, img, loading: bool = False) -> str:
     if isinstance(img, str):                       # cached card thumbnail (data URI)
         img_html = f'<img src="{img}" alt="" />'
     elif img is not None:
         img_html = f'<img src="{image_to_data_uri(img)}" alt="" />'
+    elif loading:
+        img_html = '<div class="product-card-noimg">Loading image…</div>'
     else:
         img_html = '<div class="product-card-noimg">No image<br>available</div>'
 
@@ -1512,53 +1825,105 @@ def render_card_html(item, img) -> str:
     """
 
 
-# ===========================================================
-# Background warm-up
-# ===========================================================
-# The warm-up thread uses Streamlit's caches outside a page run, which makes
-# Streamlit log a harmless "missing ScriptRunContext" warning each time.
-logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
+def _change_page(delta: int):
+    st.session_state.page = st.session_state.get("page", 1) + delta
 
 
-def warm_caches_once():
-    """Loads what the first screen needs into the shared caches: inventory,
-    app images, filter options and the first pages' card images. Each step
-    is a cache hit when already loaded."""
-    base_df = build_inventory_df(DATA_FILTER_VERSION)
-    build_id = base_df.attrs.get("build_id", 0)
-    full_df = gallery_data(build_id, base_df)
-    compute_filter_options(base_df, build_id)
-    refs = full_df["image_1920"].iloc[:PAGE_SIZE * WARMUP_PREFETCH_PAGES].tolist()
-    if refs:
-        load_images_parallel(get_datalake_service_client(), refs)
+@st.fragment
+def render_results(df: pd.DataFrame, cols_per_row: int):
+    """Product grid + pager. A fragment: Previous/Next re-run only this part,
+    not the filters, data lookup and the rest of the page."""
+    total = len(df)
+    total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = min(max(1, st.session_state.get("page", 1)), total_pages)
+    st.session_state.page = page
+
+    start = (page - 1) * PAGE_SIZE
+    end = start + PAGE_SIZE
+    page_df = df.iloc[start:end]
+
+    refs = page_df["image_1920"].tolist()
+    images_started = time.perf_counter()
+    with st.spinner("Loading images..."):
+        image_lookup, pending = get_card_images(refs, timeout=PAGE_IMAGE_WAIT_SECONDS)
+    log.info("page %d: %d cards, images ready in %.1fs%s", page, len(refs),
+             time.perf_counter() - images_started,
+             f" ({len(pending)} still loading, shown as they arrive)" if pending else "")
+
+    st.markdown(
+        f"<div style='color: var(--muted-text); font-size:13px; margin-bottom:8px;'>"
+        f"{total} product{'s' if total != 1 else ''} found</div>",
+        unsafe_allow_html=True,
+    )
+    status = st.empty()
+
+    if total == 0:
+        st.info("No products match the current filters.")
+    else:
+        for row_start in range(0, len(page_df), cols_per_row):
+            row_items = page_df.iloc[row_start:row_start + cols_per_row]
+            cols = st.columns(cols_per_row)
+            for col, (_, item) in zip(cols, row_items.iterrows()):
+                with col:
+                    img = image_lookup.get(item["image_1920"])
+                    if DEBUG:
+                        st.caption(str(item["image_1920"]))
+                    loading = item["image_1920"] in pending
+                    st.markdown(render_card_html(item, img, loading), unsafe_allow_html=True)
+
+    st.divider()
+    c1, c2, c3 = st.columns([1, 2, 1])
+    with c1:
+        st.button("⬅ Previous", key="page_prev", disabled=page <= 1,
+                  on_click=_change_page, args=(-1,))
+    with c2:
+        st.markdown(
+            f"<div class='page-indicator'>Page {page} of {total_pages} "
+            f"({total} products)</div>",
+            unsafe_allow_html=True,
+        )
+    with c3:
+        st.button("Next ➡", key="page_next", disabled=page >= total_pages,
+                  on_click=_change_page, args=(1,))
+
+    # Load the next page's images in the background so "Next" is instant.
+    prefetch_images(df["image_1920"].iloc[end:end + PAGE_SIZE].tolist())
+
+    if pending:
+        _show_images_as_they_arrive(status, pending)
 
 
-@st.cache_resource
-def start_background_warmup() -> bool:
-    """One warm-up thread per app process, started on the first visit (the
-    login page), so data loads while people sign in. It re-runs every
-    WARMUP_EVERY_SECONDS, so the daily rebuild and new app uploads are
-    usually picked up before a user has to wait for them."""
-    def loop():
-        while True:
-            try:
-                warm_caches_once()
-            except Exception:
-                log.warning("Background warm-up failed; data loads on first use instead", exc_info=True)
-            time.sleep(WARMUP_EVERY_SECONDS)
-
-    threading.Thread(target=loop, name="gallery-warmup", daemon=True).start()
-    return True
+def _show_images_as_they_arrive(status, pending: dict):
+    """The page is already on screen with placeholders for slow images. Wait
+    for them here and redraw the grid once they are in. Updating the status
+    line every half second also lets Streamlit stop this wait as soon as the
+    user clicks something."""
+    futures = list(pending.values())
+    deadline = time.monotonic() + PENDING_IMAGE_MAX_WAIT_SECONDS
+    while time.monotonic() < deadline:
+        left = sum(not f.done() for f in futures)
+        if not left:
+            break
+        status.caption(f"Loading {left} more image{'s' if left != 1 else ''}…")
+        wait_futures(futures, timeout=0.5)
+    status.empty()
+    if not any(f.done() for f in futures):
+        return
+    try:
+        st.rerun(scope="fragment")
+    except StreamlitAPIException:
+        st.rerun()          # first render is part of a full page run, where a fragment rerun isn't allowed
 
 
 # ===========================================================
 # Main
 # ===========================================================
 def main():
+    run_started = time.perf_counter()
     inject_theme()
 
     if not MISSING_CONFIG:
-        start_background_warmup()          # data loads while the user signs in
+        start_background_refresh()          # data loads while the user signs in
 
     if not check_login():
         return
@@ -1574,150 +1939,42 @@ def main():
         return
 
     try:
-        with st.spinner("Loading your product gallery..."):
-            base_df = build_inventory_df(DATA_FILTER_VERSION)
-            build_id = base_df.attrs.get("build_id", 0)
-            full_df = gallery_data(build_id, base_df)
+        snap = data_store().snapshot
+        if snap is None:
+            # Only after an app (re)start, before the first build has finished.
+            with st.spinner("Loading your product gallery..."):
+                snap = get_snapshot()
     except Exception as e:
         st.error(f"Failed to connect / fetch data: {e}")
         return
 
+    full_df = snap.df
+    filter_options = snap.options
+
     if "mobile_filters_open" not in st.session_state:
         st.session_state.mobile_filters_open = False
 
-    # Hamburger button for mobile users: opens a left-aligned filter drawer
-    # while leaving the desktop two-panel layout completely unchanged.
-    # Only rendered while the drawer is CLOSED - the open drawer gets its
-    # own dedicated close (✕) button inside render_filters() instead of
-    # reusing this one, so there's never a floating icon that can end up
-    # sitting on top of the drawer's own heading or the banner above it.
     if not st.session_state.mobile_filters_open:
         if st.button("☰", key="mobile_filters_toggle", help="Open filters"):
             st.session_state.mobile_filters_open = True
             st.rerun()
 
-    # Render exactly one filter layout at a time to keep the widget state
-    # consistent and ensure the selected filters are applied once.
-    filter_options = compute_filter_options(base_df, build_id)
-
     if st.session_state.mobile_filters_open:
-        filters = render_filters(full_df, filter_options, "mobile_filter_panel")
+        filters = render_filters(filter_options, "mobile_filter_panel")
+        reset_page_if_filters_changed(filters)
         with st.container():
-            df = apply_filters(full_df, filters)
-            total = len(df)
-            total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
-
-            if "page" not in st.session_state:
-                st.session_state.page = 1
-            st.session_state.page = min(max(1, st.session_state.page), total_pages)
-
-            start = (st.session_state.page - 1) * PAGE_SIZE
-            end = start + PAGE_SIZE
-            page_df = df.iloc[start:end]
-
-            client = get_datalake_service_client()
-            refs = page_df["image_1920"].tolist()
-            with st.spinner("Loading images..."):
-                results = load_images_parallel(client, refs) if refs else []
-            image_lookup = dict(zip(refs, results))
-
-            cols_per_row = filters["cols_per_row"]
-
-            st.markdown(
-                f"<div style='color: var(--muted-text); font-size:13px; margin-bottom:8px;'>"
-                f"{total} product{'s' if total != 1 else ''} found</div>",
-                unsafe_allow_html=True,
-            )
-
-            if total == 0:
-                st.info("No products match the current filters.")
-            else:
-                for row_start in range(0, len(page_df), cols_per_row):
-                    row_items = page_df.iloc[row_start:row_start + cols_per_row]
-                    cols = st.columns(cols_per_row)
-                    for col, (_, item) in zip(cols, row_items.iterrows()):
-                        with col:
-                            img, raw, err = image_lookup.get(item["image_1920"], (None, None, "No image reference"))
-                            if DEBUG:
-                                st.caption(str(item["image_1920"]))
-                            st.markdown(render_card_html(item, img), unsafe_allow_html=True)
-
-            st.divider()
-            c1, c2, c3 = st.columns([1, 2, 1])
-            with c1:
-                if st.button("⬅ Previous", disabled=st.session_state.page <= 1):
-                    st.session_state.page -= 1
-                    st.rerun()
-            with c2:
-                st.markdown(
-                    f"<div class='page-indicator'>Page {st.session_state.page} of {total_pages} "
-                    f"({total} products)</div>",
-                    unsafe_allow_html=True,
-                )
-            with c3:
-                if st.button("Next ➡", disabled=st.session_state.page >= total_pages):
-                    st.session_state.page += 1
-                    st.rerun()
+            render_results(apply_filters(full_df, filters), filters["cols_per_row"])
     else:
         filter_col, results_col = st.columns([1.25, 3])
         with filter_col:
-            filters = render_filters(full_df, filter_options, "filter_panel")
+            filters = render_filters(filter_options, "filter_panel")
+        reset_page_if_filters_changed(filters)
         with results_col:
-            df = apply_filters(full_df, filters)
-            total = len(df)
-            total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+            render_results(apply_filters(full_df, filters), filters["cols_per_row"])
 
-            if "page" not in st.session_state:
-                st.session_state.page = 1
-            st.session_state.page = min(max(1, st.session_state.page), total_pages)
-
-            start = (st.session_state.page - 1) * PAGE_SIZE
-            end = start + PAGE_SIZE
-            page_df = df.iloc[start:end]
-
-            client = get_datalake_service_client()
-            refs = page_df["image_1920"].tolist()
-            with st.spinner("Loading images..."):
-                results = load_images_parallel(client, refs) if refs else []
-            image_lookup = dict(zip(refs, results))
-
-            cols_per_row = filters["cols_per_row"]
-
-            st.markdown(
-                f"<div style='color: var(--muted-text); font-size:13px; margin-bottom:8px;'>"
-                f"{total} product{'s' if total != 1 else ''} found</div>",
-                unsafe_allow_html=True,
-            )
-
-            if total == 0:
-                st.info("No products match the current filters.")
-            else:
-                for row_start in range(0, len(page_df), cols_per_row):
-                    row_items = page_df.iloc[row_start:row_start + cols_per_row]
-                    cols = st.columns(cols_per_row)
-                    for col, (_, item) in zip(cols, row_items.iterrows()):
-                        with col:
-                            img, raw, err = image_lookup.get(item["image_1920"], (None, None, "No image reference"))
-                            if DEBUG:
-                                st.caption(str(item["image_1920"]))
-                            st.markdown(render_card_html(item, img), unsafe_allow_html=True)
-
-            st.divider()
-            c1, c2, c3 = st.columns([1, 2, 1])
-            with c1:
-                if st.button("⬅ Previous", disabled=st.session_state.page <= 1):
-                    st.session_state.page -= 1
-                    st.rerun()
-            with c2:
-                st.markdown(
-                    f"<div class='page-indicator'>Page {st.session_state.page} of {total_pages} "
-                    f"({total} products)</div>",
-                    unsafe_allow_html=True,
-                )
-            with c3:
-                if st.button("Next ➡", disabled=st.session_state.page >= total_pages):
-                    st.session_state.page += 1
-                    st.rerun()
+    # Time the server spent building this page. If the browser takes much
+    # longer than this to show it, the delay is in the browser / network.
+    log.info("page built on the server in %.1fs", time.perf_counter() - run_started)
 
 
 if __name__ == "__main__":
