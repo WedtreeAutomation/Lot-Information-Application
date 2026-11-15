@@ -13,7 +13,8 @@ import time
 import warnings
 import html as html_lib
 from io import BytesIO
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 from dataclasses import dataclass, replace
 from urllib.parse import urlparse
 from collections import OrderedDict
@@ -1037,6 +1038,14 @@ def prefetch_images(refs):
 # ===========================================================
 # Data loading
 # ===========================================================
+def _id_text(expr: pl.Expr) -> pl.Expr:
+    """An id / product id as plain text, the way T-SQL CAST(... AS VARCHAR)
+    writes it: 12345, never 12345.0. Delta tables store these ids as bigint in
+    some places and as double/decimal or text in others; without this,
+    "12345" and "12345.0" would never match."""
+    return expr.cast(pl.Utf8).str.strip_chars().str.replace(r"\.0+$", "")
+
+
 def _scan(lakehouse_id, schema, table, columns) -> pl.LazyFrame:
     # scan_delta (lazy): nothing is read until collect(), so only the needed
     # columns are fetched and filters can skip files / row groups.
