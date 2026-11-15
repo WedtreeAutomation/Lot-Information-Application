@@ -151,7 +151,13 @@ COMPANY_LABELS = {
     "Wedtree eStore Private Limited - HO": "HO",
 }
 
-EXCLUDED_COMPANIES = {"Saree Trails", "Wedtree eStore Private Limited - Online"}
+# Same list as the lot-coverage query. The pre-joined gallery table may have been
+# built with an older list, so build_base_inventory re-applies this one.
+EXCLUDED_COMPANIES = {
+    "Saree Trails",
+    "Wedtree eStore Private Limited - Online",
+    "Wedtree Estore private Limited - Saree Trails",
+}
 EXCLUDED_LOCATIONS = {
     "Physical Locations/Subcontracting Location",
     "Virtual Locations/Production",
@@ -1215,11 +1221,32 @@ def build_base_inventory() -> pd.DataFrame:
     started = time.perf_counter()
     plan = _inventory_plan_from_gold() if GALLERY_TABLE else _inventory_plan_from_odoo()
 
+    # Re-apply the company exclusions: the gallery table may have been built
+    # with an older EXCLUDED_COMPANIES list.
+    plan = plan.filter(~pl.col("company").is_in(sorted(EXCLUDED_COMPANIES)))
+
+    lot_text = pl.col("lot_number").cast(pl.Utf8).fill_null("").str.strip_chars()
     plan = plan.with_columns(
         pl.col("stock_move_date").cast(pl.Date, strict=False),
         pl.col("image_1920").fill_null(NO_IMAGE),
         pl.col("pi_ids").fill_null(""),
     ).with_columns(
+        # One key per lot, the same way the lot-coverage query counts lots:
+        # company + product + UPPER(TRIM(lot number)). Rows without a lot
+        # number get no key, so they are never counted as lots.
+        pl.when(lot_text == "")
+        .then(None)
+        .otherwise(
+            pl.concat_str(
+                [
+                    pl.col("company").cast(pl.Utf8).fill_null(""),
+                    pl.col("product_id").cast(pl.Utf8).fill_null(""),
+                    lot_text.str.to_uppercase(),
+                ],
+                separator="|",
+            )
+        )
+        .alias("_lot_count_key"),
         (pl.lit(date.today()) - pl.col("stock_move_date")).dt.total_days().alias("overall_age"),
         (pl.col("image_1920") == NO_IMAGE).alias("_no_image"),
         # Lower-cased search text, so a search is one vectorised .contains()
@@ -1558,7 +1585,7 @@ def start_background_refresh() -> bool:
 # Filtering (vectorised - no per-row Python functions)
 # ===========================================================
 FILTER_KEYS = ("company", "category", "vendor", "location", "search",
-               "lot_number", "in_stock_only", "without_images")
+               "lot_number", "in_stock_only", "with_images", "without_images")
 
 
 def apply_filters(df, f):
@@ -1586,9 +1613,31 @@ def apply_filters(df, f):
         mask &= df["_lot_lc"].str.contains(lot_needle, regex=False)
     if f["in_stock_only"]:
         mask &= df["available_inventory"].fillna(0) > 0
+    if f.get("with_images"):
+        mask &= df["image_1920"] != NO_IMAGE
     if f["without_images"]:
         mask &= df["image_1920"] == NO_IMAGE
     return df[mask]
+
+
+def lot_counts(df: pd.DataFrame) -> dict:
+    """Lot counts for the (filtered) rows, using the same rules as the
+    lot-coverage query: a lot is company + product + lot number, counted once
+    however many locations it is in, and only if at least one of its rows has
+    quantity > 0. A lot's image is the same on all its rows (it is decided
+    per product + lot), so "with photo" + "pending" always add up to "lots"."""
+    in_stock = df[(df["available_inventory"].fillna(0) > 0) & df["_lot_count_key"].notna()]
+    has_image = in_stock["image_1920"] != NO_IMAGE
+    return {
+        "lots": int(in_stock["_lot_count_key"].nunique()),
+        "with_photo": int(in_stock.loc[has_image, "_lot_count_key"].nunique()),
+        "pending": int(in_stock.loc[~has_image, "_lot_count_key"].nunique()),
+    }
+
+
+def _untick_other_image_filter(changed_key: str, other_key: str):
+    if st.session_state.get(changed_key):
+        st.session_state[other_key] = False
 
 
 def render_filters(options: dict, panel_key: str = "filter_panel") -> dict:
@@ -1600,6 +1649,7 @@ def render_filters(options: dict, panel_key: str = "filter_panel") -> dict:
         "search": "",
         "lot_number": "",
         "in_stock_only": False,
+        "with_images": False,
         "without_images": False,
         "cols_per_row": 4,
     })
@@ -1706,11 +1756,26 @@ def render_filters(options: dict, panel_key: str = "filter_panel") -> dict:
         )
         filter_state["in_stock_only"] = in_stock_only
 
+        # "With images" and "Without images" exclude each other: ticking one
+        # unticks the other. The widgets are driven by their session-state keys
+        # (no value=), so the callback can change the other box safely.
+        for state_key, widget_key in (("with_images", "filters_with_images"),
+                                      ("without_images", "filters_without_images")):
+            if widget_key not in st.session_state:
+                st.session_state[widget_key] = filter_state.get(state_key, False)
+        with_images = st.checkbox(
+            "With images",
+            key="filters_with_images",
+            on_change=_untick_other_image_filter,
+            args=("filters_with_images", "filters_without_images"),
+        )
         without_images = st.checkbox(
             "Without images",
-            value=filter_state.get("without_images", False),
             key="filters_without_images",
+            on_change=_untick_other_image_filter,
+            args=("filters_without_images", "filters_with_images"),
         )
+        filter_state["with_images"] = with_images
         filter_state["without_images"] = without_images
 
         cols_per_row = st.slider(
@@ -1741,6 +1806,7 @@ def render_filters(options: dict, panel_key: str = "filter_panel") -> dict:
         "search": search,
         "lot_number": lot_number,
         "in_stock_only": in_stock_only,
+        "with_images": with_images,
         "without_images": without_images,
         "cols_per_row": cols_per_row,
     }
@@ -1850,9 +1916,14 @@ def render_results(df: pd.DataFrame, cols_per_row: int):
              time.perf_counter() - images_started,
              f" ({len(pending)} still loading, shown as they arrive)" if pending else "")
 
+    # Lots, not rows: same rules as the lot-coverage query (company + product +
+    # lot, quantity > 0), so the numbers match it for the same filters.
+    counts = lot_counts(df)
     st.markdown(
         f"<div style='color: var(--muted-text); font-size:13px; margin-bottom:8px;'>"
-        f"{total} product{'s' if total != 1 else ''} found</div>",
+        f"<b style='color: var(--panel-text);'>{counts['lots']:,} lot{'s' if counts['lots'] != 1 else ''} in stock</b>"
+        f" · {counts['with_photo']:,} with photo · {counts['pending']:,} pending"
+        f" · {total:,} card{'s' if total != 1 else ''}</div>",
         unsafe_allow_html=True,
     )
     status = st.empty()
@@ -1879,7 +1950,7 @@ def render_results(df: pd.DataFrame, cols_per_row: int):
     with c2:
         st.markdown(
             f"<div class='page-indicator'>Page {page} of {total_pages} "
-            f"({total} products)</div>",
+            f"({total:,} cards)</div>",
             unsafe_allow_html=True,
         )
     with c3:
