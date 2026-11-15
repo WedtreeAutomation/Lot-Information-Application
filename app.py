@@ -92,7 +92,8 @@ REFRESH_CHECK_SECONDS = 60             # background loop tick
 # so it is re-read far more often than the inventory: new uploads show up in
 # the report within this many seconds.
 APP_IMAGES_TTL_SECONDS = 5 * 60
-APP_IMAGES_WAIT_SECONDS = 3         # first load waits at most this long for the uploads table
+APP_IMAGES_WAIT_SECONDS = 15        # first load waits at most this long for the uploads table,
+                                    # so the first counts already include app uploads
 NO_IMAGE = "No image available"
 
 WARMUP_PREFETCH_PAGES = 2          # first gallery pages whose images are pre-loaded
@@ -1184,7 +1185,10 @@ def _inventory_plan_from_gold() -> pl.LazyFrame:
 
 def _source_tables():
     if GALLERY_TABLE:
-        return [(GALLERY_TABLE_SCHEMA, GALLERY_TABLE)]
+        # product_images too: lot images are read live from it (see
+        # build_base_inventory), so an ETL load of new images or new lot
+        # records triggers a rebuild even before the gallery table is rebuilt.
+        return [(GALLERY_TABLE_SCHEMA, GALLERY_TABLE), ("Odoo", "product_images")]
     return [("Odoo", name) for name in ODOO_SOURCE_TABLES]
 
 
@@ -1214,10 +1218,56 @@ def source_version():
         return None
 
 
-def build_base_inventory() -> pd.DataFrame:
-    """Runs the query and returns the inventory, sorted "products with images
-    first", with helper columns the filters use (computed once here instead
-    of on every click)."""
+def load_product_images_index() -> pl.DataFrame:
+    """Live Odoo.product_images with the same rows and rules as the
+    lot-coverage query: one row per id, with
+      pi_id       the product_images id (text)
+      _img_key    product_id|UPPER(TRIM(name))  - the lot, across companies
+      odoo_image  the Odoo image path, or null when blank/False/None/null"""
+    started = time.perf_counter()
+    lot_name = pl.col("name").cast(pl.Utf8).str.strip_chars()
+    index = (
+        _scan(lakehouse_id_silver, "Odoo", "product_images", ["id", "name", "product_id", "image_1920"])
+        .filter(pl.col("id").is_not_null() & lot_name.is_not_null() & (lot_name != ""))
+        .select(
+            pl.col("id").cast(pl.Utf8).str.strip_chars().alias("pi_id"),
+            pl.concat_str(
+                [pl.col("product_id").cast(pl.Utf8).str.strip_chars(), lot_name.str.to_uppercase()],
+                separator="|",
+            ).alias("_img_key"),
+            pl.col("image_1920").cast(pl.Utf8).str.strip_chars().alias("odoo_image"),
+        )
+        .filter(pl.col("_img_key").is_not_null())
+        .with_columns(
+            pl.when(
+                pl.col("odoo_image").is_null()
+                | pl.col("odoo_image").str.to_lowercase().is_in(["", "false", "none", "null"])
+            ).then(None).otherwise(pl.col("odoo_image")).alias("odoo_image")
+        )
+        .collect()
+    )
+    log.info("product_images read live: %d rows in %.1fs", index.height, time.perf_counter() - started)
+    return index
+
+
+def _lot_ids_from_pi_ids(df: pd.DataFrame) -> pd.DataFrame:
+    """Fallback when product_images can't be read: the ids stored in the
+    gallery table's pi_ids column (pi_id, _img_key)."""
+    ids = df[["_img_key", "pi_ids"]].dropna(subset=["_img_key"])
+    ids = ids.assign(pi_id=ids["pi_ids"].astype(str).str.split(",")).explode("pi_id")
+    ids["pi_id"] = ids["pi_id"].fillna("").str.strip()
+    return ids.loc[ids["pi_id"] != "", ["pi_id", "_img_key"]].drop_duplicates().reset_index(drop=True)
+
+
+def build_base_inventory():
+    """Runs the query and returns (inventory, lot_ids).
+
+    inventory: stock rows sorted "products with images first", with helper
+        columns the filters use (computed once here instead of on every click).
+        image_1920 is the lot's ODOO image taken live from product_images, so
+        it matches the lot-coverage query even if the gallery table is older.
+    lot_ids: every product_images id of the lots in the inventory
+        (pi_id, _img_key) - used to match app uploads to lots."""
     started = time.perf_counter()
     plan = _inventory_plan_from_gold() if GALLERY_TABLE else _inventory_plan_from_odoo()
 
@@ -1228,9 +1278,41 @@ def build_base_inventory() -> pd.DataFrame:
     lot_text = pl.col("lot_number").cast(pl.Utf8).fill_null("").str.strip_chars()
     plan = plan.with_columns(
         pl.col("stock_move_date").cast(pl.Date, strict=False),
-        pl.col("image_1920").fill_null(NO_IMAGE),
         pl.col("pi_ids").fill_null(""),
-    ).with_columns(
+        # The lot across companies (product + lot), the key the query uses to
+        # decide a lot's image. Rows without a lot number get no key.
+        pl.when(lot_text == "")
+        .then(None)
+        .otherwise(
+            pl.concat_str(
+                [pl.col("product_id").cast(pl.Utf8).str.strip_chars().fill_null(""),
+                 lot_text.str.to_uppercase()],
+                separator="|",
+            )
+        )
+        .alias("_img_key"),
+    )
+
+    # Lot image = Odoo image from LIVE product_images (any of the lot's rows
+    # that has one), exactly as the query decides it. If product_images can't
+    # be read, fall back to the image stored in the gallery table.
+    try:
+        pi_index = load_product_images_index()
+        odoo_by_lot = (
+            pi_index.filter(pl.col("odoo_image").is_not_null())
+            .sort("pi_id")
+            .group_by("_img_key")
+            .agg(pl.col("odoo_image").first().alias("_live_image"))
+        )
+        plan = plan.join(odoo_by_lot.lazy(), on="_img_key", how="left").with_columns(
+            pl.col("_live_image").fill_null(NO_IMAGE).alias("image_1920")
+        ).drop("_live_image")
+    except Exception:
+        log.warning("Couldn't read product_images; using the images stored in the gallery table", exc_info=True)
+        pi_index = None
+        plan = plan.with_columns(pl.col("image_1920").fill_null(NO_IMAGE))
+
+    plan = plan.with_columns(
         # One key per lot, the same way the lot-coverage query counts lots:
         # company + product + UPPER(TRIM(lot number)). Rows without a lot
         # number get no key, so they are never counted as lots.
@@ -1275,12 +1357,23 @@ def build_base_inventory() -> pd.DataFrame:
     mapping = {value: normalize_category_value(value) for value in categories.dropna().unique()}
     df["_cat_norm"] = categories.map(mapping).fillna("")
 
+    # Ids of the lots that are in the inventory (only those, to keep memory low).
+    if pi_index is not None:
+        keys = pl.Series("_img_key", df["_img_key"].dropna().unique().tolist(), dtype=pl.Utf8)
+        lot_ids = (
+            pi_index.filter(pl.col("_img_key").is_in(keys))
+            .select("pi_id", "_img_key").unique().to_pandas()
+        )
+    else:
+        lot_ids = _lot_ids_from_pi_ids(df)
+
     log.info(
-        "inventory built from %s: %d rows in %.1fs",
+        "inventory built from %s: %d rows, %d lot ids, images from %s, in %.1fs",
         f"{GALLERY_TABLE_SCHEMA}.{GALLERY_TABLE}" if GALLERY_TABLE else "Odoo tables",
-        len(df), time.perf_counter() - started,
+        len(df), len(lot_ids), "live product_images" if pi_index is not None else "the gallery table",
+        time.perf_counter() - started,
     )
-    return df
+    return df, lot_ids
 
 
 # ===========================================================
@@ -1321,25 +1414,31 @@ def load_app_images() -> pd.DataFrame:
     return uploads.to_pandas() if uploads.height else empty
 
 
-def apply_app_images(df: pd.DataFrame, uploads: pd.DataFrame) -> pd.DataFrame:
-    """image_1920 = the lot's app image where it has one, else its Odoo image.
-    Keeps "products with images first", so a lot that only got its image in
-    the app moves up with the others (the rest of the order is unchanged)."""
-    if uploads.empty or "pi_ids" not in df.columns:
-        return df
-    # Each stock row lists its lot's product_images ids ("123" or "123,456").
-    row_ids = df["pi_ids"].astype(str).str.split(",").explode()
-    row_ids = row_ids[row_ids.isin(set(uploads["pi_id"]))]
-    if row_ids.empty:
+def apply_app_images(df: pd.DataFrame, uploads: pd.DataFrame, lot_ids: pd.DataFrame) -> pd.DataFrame:
+    """image_1920 = the lot's app image where it has one, else its Odoo image -
+    the same rule as the lot-coverage query: a lot (product + lot number) has an
+    app image if ANY of its product_images ids has an upload. lot_ids comes from
+    live product_images, so uploads to lot records newer than the gallery table
+    are matched too. Keeps "products with images first", so a lot that only got
+    its image in the app moves up with the others (the rest of the order is
+    unchanged)."""
+    if uploads is None or uploads.empty or lot_ids is None or lot_ids.empty:
         return df
     matches = (
-        pd.DataFrame({"row": row_ids.index, "pi_id": row_ids.to_numpy()})
-        .merge(uploads, on="pi_id", how="inner")
-        .sort_values("uploaded_at", kind="stable")
-        .drop_duplicates("row", keep="last")         # newest upload if several rows of the lot have one
+        uploads.merge(lot_ids, on="pi_id", how="inner")
+        .sort_values("uploaded_at", kind="stable", na_position="first")
+        .drop_duplicates("_img_key", keep="last")     # newest upload if several ids of the lot have one
     )
+    log.info("app images: %d uploads matched to %d lots", len(uploads), len(matches))
+    if matches.empty:
+        return df
+    paths = pd.Series(matches["image_path"].to_numpy(), index=matches["_img_key"].to_numpy())
+    new_image = df["_img_key"].map(paths)
+    has_upload = new_image.notna().to_numpy()
+    if not has_upload.any():
+        return df
     df = df.copy()
-    df.loc[matches["row"].to_numpy(), "image_1920"] = matches["image_path"].to_numpy()
+    df.loc[has_upload, "image_1920"] = new_image[has_upload].to_numpy()
     no_image = (df["image_1920"] == NO_IMAGE).to_numpy()
     return df.iloc[no_image.argsort(kind="stable")].reset_index(drop=True)
 
@@ -1382,6 +1481,7 @@ def compute_filter_options(df: pd.DataFrame) -> dict:
 class GallerySnapshot:
     df: pd.DataFrame          # inventory with app images applied - READ-ONLY
     base_df: pd.DataFrame     # inventory as built from Fabric - READ-ONLY
+    lot_ids: pd.DataFrame     # product_images ids of each lot (pi_id, _img_key) - READ-ONLY
     options: dict
     version: tuple            # source Delta versions the build was made from
     built_at: float
@@ -1492,7 +1592,7 @@ def refresh_data() -> GallerySnapshot:
             store.snapshot = replace(snap, images_at=now, checked_at=checked_at)
             return store.snapshot
 
-        base_df = options = None
+        base_df = lot_ids = options = None
         built_at = now
         timings = {}
         started = time.perf_counter()
@@ -1503,8 +1603,9 @@ def refresh_data() -> GallerySnapshot:
             with ThreadPoolExecutor(max_workers=1, thread_name_prefix="gallery-version") as ex:
                 version_job = ex.submit(_timed, timings, "version check", source_version)
                 try:
-                    base_df = _timed(timings, "inventory", build_base_inventory)
-                    options = _timed(timings, "filter options", compute_filter_options, base_df)
+                    new_df, new_lot_ids = _timed(timings, "inventory", build_base_inventory)
+                    new_options = _timed(timings, "filter options", compute_filter_options, new_df)
+                    base_df, lot_ids, options = new_df, new_lot_ids, new_options
                     version = version_job.result() or ()
                     checked_at = now
                 except Exception:
@@ -1517,7 +1618,7 @@ def refresh_data() -> GallerySnapshot:
                 taken = _timed(timings, "waiting for app image table", _take_uploads,
                                store, APP_IMAGES_WAIT_SECONDS)
         if base_df is None:
-            base_df, options, built_at = snap.base_df, snap.options, snap.built_at
+            base_df, lot_ids, options, built_at = snap.base_df, snap.lot_ids, snap.options, snap.built_at
 
         if taken is not None:
             uploads, images_at = taken[0], now
@@ -1529,14 +1630,14 @@ def refresh_data() -> GallerySnapshot:
                     "App image table is still loading; showing Odoo images until it is ready. "
                     "If this keeps happening, compact the table (see build_product_gallery_table.py)."
                 )
-        df = (_timed(timings, "apply app images", apply_app_images, base_df, uploads)
+        df = (_timed(timings, "apply app images", apply_app_images, base_df, uploads, lot_ids)
               if uploads is not None else base_df)
         log.info(
             "data refresh done in %.1fs (%s)", time.perf_counter() - started,
             ", ".join(f"{name} {secs:.1f}s" for name, secs in timings.items()),
         )
         store.snapshot = GallerySnapshot(
-            df=df, base_df=base_df, options=options, version=version,
+            df=df, base_df=base_df, lot_ids=lot_ids, options=options, version=version,
             built_at=built_at, images_at=images_at, checked_at=checked_at,
         )
         return store.snapshot
