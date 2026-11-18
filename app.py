@@ -5,6 +5,7 @@ if sys.platform.startswith("win") and sys.version_info < (3, 14):
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 import base64
+import re
 import hashlib
 import hmac
 import logging
@@ -13,10 +14,9 @@ import time
 import warnings
 import html as html_lib
 from io import BytesIO
-from datetime import date
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from urllib.parse import urlparse
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout, wait as wait_futures
@@ -1141,8 +1141,8 @@ def _inventory_plan_from_odoo() -> pl.LazyFrame:
         lakehouse_id_silver, "Odoo", "product_images",
         ["id", "name", "product_id", "image_1920"],
     ).select(
-        pl.col("id").cast(pl.Utf8).str.strip_chars().alias("pi_id"),
-        pl.col("product_id").cast(pl.Utf8).str.strip_chars().alias("product_id"),
+        _id_text(pl.col("id")).alias("pi_id"),
+        _id_text(pl.col("product_id")).alias("product_id"),
         pl.col("name").cast(pl.Utf8).str.strip_chars().str.to_uppercase().alias("_lot_key"),
         pl.col("image_1920").cast(pl.Utf8).str.strip_chars().alias("image_1920"),
     ).filter(
@@ -1240,9 +1240,9 @@ def load_product_images_index() -> pl.DataFrame:
         _scan(lakehouse_id_silver, "Odoo", "product_images", ["id", "name", "product_id", "image_1920"])
         .filter(pl.col("id").is_not_null() & lot_name.is_not_null() & (lot_name != ""))
         .select(
-            pl.col("id").cast(pl.Utf8).str.strip_chars().alias("pi_id"),
+            _id_text(pl.col("id")).alias("pi_id"),
             pl.concat_str(
-                [pl.col("product_id").cast(pl.Utf8).str.strip_chars(), lot_name.str.to_uppercase()],
+                [_id_text(pl.col("product_id")), lot_name.str.to_uppercase()],
                 separator="|",
             ).alias("_img_key"),
             pl.col("image_1920").cast(pl.Utf8).str.strip_chars().alias("odoo_image"),
@@ -1265,7 +1265,7 @@ def _lot_ids_from_pi_ids(df: pd.DataFrame) -> pd.DataFrame:
     gallery table's pi_ids column (pi_id, _img_key)."""
     ids = df[["_img_key", "pi_ids"]].dropna(subset=["_img_key"])
     ids = ids.assign(pi_id=ids["pi_ids"].astype(str).str.split(",")).explode("pi_id")
-    ids["pi_id"] = ids["pi_id"].fillna("").str.strip()
+    ids["pi_id"] = ids["pi_id"].fillna("").str.strip().str.replace(r"\.0+$", "", regex=True)
     return ids.loc[ids["pi_id"] != "", ["pi_id", "_img_key"]].drop_duplicates().reset_index(drop=True)
 
 
@@ -1295,7 +1295,7 @@ def build_base_inventory():
         .then(None)
         .otherwise(
             pl.concat_str(
-                [pl.col("product_id").cast(pl.Utf8).str.strip_chars().fill_null(""),
+                [_id_text(pl.col("product_id")).fill_null(""),
                  lot_text.str.to_uppercase()],
                 separator="|",
             )
@@ -1332,7 +1332,7 @@ def build_base_inventory():
             pl.concat_str(
                 [
                     pl.col("company").cast(pl.Utf8).fill_null(""),
-                    pl.col("product_id").cast(pl.Utf8).fill_null(""),
+                    _id_text(pl.col("product_id")).fill_null(""),
                     lot_text.str.to_uppercase(),
                 ],
                 separator="|",
@@ -1392,48 +1392,46 @@ def build_base_inventory():
 # matched on the lot's product_images id. Only this small table is re-read
 # every APP_IMAGES_TTL_SECONDS, so new uploads appear without a rebuild.
 # ===========================================================
+EMPTY_UPLOADS = pd.DataFrame({"pi_id": pd.Series(dtype=str), "image_path": pd.Series(dtype=str),
+                              "uploaded_at": pd.Series(dtype="datetime64[ns, UTC]")})
+
+
 def load_app_images() -> pd.DataFrame:
     """Newest app upload per lot: columns pi_id (text), image_path, uploaded_at.
-    Empty if the table doesn't exist yet or can't be read (the report then
-    simply shows the Odoo images)."""
-    empty = pd.DataFrame({"pi_id": pd.Series(dtype=str), "image_path": pd.Series(dtype=str),
-                          "uploaded_at": pd.Series(dtype="datetime64[ns, UTC]")})
-    try:
-        uploads = (
-            pl.scan_delta(
-                table_uri(lakehouse_id_silver, "Odoo", app_images_table_name()),
-                storage_options=storage_options,
-            )
-            .select(
-                pl.col("id").cast(pl.Utf8).str.strip_chars().alias("pi_id"),
-                pl.col("image_path").cast(pl.Utf8).str.strip_chars().alias("image_path"),
-                pl.col("uploaded_at"),
-            )
-            .filter(
-                pl.col("pi_id").is_not_null()
-                & (pl.col("pi_id") != "")
-                & pl.col("image_path").str.starts_with("abfss://")
-            )
-            .sort("uploaded_at", nulls_last=False)
-            .unique(subset=["pi_id"], keep="last")
-            .collect()
+    Raises if the table can't be read - the caller keeps the last good copy
+    and tries again on the next pass (a failure is never cached as "no uploads")."""
+    uploads = (
+        pl.scan_delta(
+            table_uri(lakehouse_id_silver, "Odoo", app_images_table_name()),
+            storage_options=storage_options,
         )
-    except Exception:
-        log.warning("Couldn't read the app image table; showing Odoo images only", exc_info=True)
-        return empty
-    return uploads.to_pandas() if uploads.height else empty
+        .select(
+            _id_text(pl.col("id")).alias("pi_id"),
+            pl.col("image_path").cast(pl.Utf8).str.strip_chars().alias("image_path"),
+            pl.col("uploaded_at"),
+        )
+        .filter(
+            pl.col("pi_id").is_not_null()
+            & (pl.col("pi_id") != "")
+            & pl.col("image_path").str.starts_with("abfss://")
+        )
+        .sort("uploaded_at", nulls_last=False)
+        .unique(subset=["pi_id"], keep="last", maintain_order=True)
+        .collect()
+    )
+    return uploads.to_pandas() if uploads.height else EMPTY_UPLOADS.copy()
 
 
-def apply_app_images(df: pd.DataFrame, uploads: pd.DataFrame, lot_ids: pd.DataFrame) -> pd.DataFrame:
+def apply_app_images(df: pd.DataFrame, uploads: pd.DataFrame, lot_ids: pd.DataFrame):
     """image_1920 = the lot's app image where it has one, else its Odoo image -
     the same rule as the lot-coverage query: a lot (product + lot number) has an
     app image if ANY of its product_images ids has an upload. lot_ids comes from
     live product_images, so uploads to lot records newer than the gallery table
     are matched too. Keeps "products with images first", so a lot that only got
     its image in the app moves up with the others (the rest of the order is
-    unchanged)."""
+    unchanged). Returns (df, number of lots that got an app image)."""
     if uploads is None or uploads.empty or lot_ids is None or lot_ids.empty:
-        return df
+        return df, 0
     matches = (
         uploads.merge(lot_ids, on="pi_id", how="inner")
         .sort_values("uploaded_at", kind="stable", na_position="first")
@@ -1441,16 +1439,16 @@ def apply_app_images(df: pd.DataFrame, uploads: pd.DataFrame, lot_ids: pd.DataFr
     )
     log.info("app images: %d uploads matched to %d lots", len(uploads), len(matches))
     if matches.empty:
-        return df
+        return df, 0
     paths = pd.Series(matches["image_path"].to_numpy(), index=matches["_img_key"].to_numpy())
     new_image = df["_img_key"].map(paths)
     has_upload = new_image.notna().to_numpy()
     if not has_upload.any():
-        return df
+        return df, 0
     df = df.copy()
     df.loc[has_upload, "image_1920"] = new_image[has_upload].to_numpy()
     no_image = (df["image_1920"] == NO_IMAGE).to_numpy()
-    return df.iloc[no_image.argsort(kind="stable")].reset_index(drop=True)
+    return df.iloc[no_image.argsort(kind="stable")].reset_index(drop=True), len(matches)
 
 
 def compute_filter_options(df: pd.DataFrame) -> dict:
@@ -1497,6 +1495,8 @@ class GallerySnapshot:
     built_at: float
     images_at: float
     checked_at: float
+    # App uploads status for the screen: read / matched_lots / error / checked_at
+    uploads_info: dict = field(default_factory=dict)
 
 
 class _DataStore:
@@ -1509,6 +1509,7 @@ class _DataStore:
         self.uploads_job = None          # Future of the read in progress
         self.uploads_df = None           # last uploads table that was read
         self.uploads_version = None      # its Delta version
+        self.uploads_error = None        # last read error (text), None once a read works
 
 
 @st.cache_resource(show_spinner=False)
@@ -1558,9 +1559,16 @@ def _take_uploads(store: _DataStore, wait: float = 0):
         uploads, version, changed = job.result(timeout=wait)
     except FutureTimeout:
         return None
-    except Exception:
-        log.warning("App image table read failed", exc_info=True)
-        uploads, version, changed = store.uploads_df, store.uploads_version, False
+    except Exception as exc:
+        # Keep the last good uploads (None on a cold start, so the next pass
+        # simply tries again) - a failed read is never taken as "no uploads".
+        log.warning("App image table read failed; will retry", exc_info=True)
+        store.uploads_error = f"{type(exc).__name__}: {str(exc).splitlines()[0][:200] if str(exc) else ''}"
+        store.uploads_job = None
+        if store.uploads_df is None:
+            return None
+        return store.uploads_df, False
+    store.uploads_error = None
     store.uploads_job = None
     if uploads is None:
         return None
@@ -1594,12 +1602,14 @@ def refresh_data() -> GallerySnapshot:
         taken = _take_uploads(store)
 
         if not inventory_due and taken is None:
-            if snap.checked_at != checked_at:
-                store.snapshot = replace(snap, checked_at=checked_at)
+            info = {**snap.uploads_info, "error": store.uploads_error}
+            if snap.checked_at != checked_at or info != snap.uploads_info:
+                store.snapshot = replace(snap, checked_at=checked_at, uploads_info=info)
             return store.snapshot
         if not inventory_due and not taken[1]:
             # Uploads table unchanged: nothing to re-apply.
-            store.snapshot = replace(snap, images_at=now, checked_at=checked_at)
+            info = {**snap.uploads_info, "checked_at": now, "error": store.uploads_error}
+            store.snapshot = replace(snap, images_at=now, checked_at=checked_at, uploads_info=info)
             return store.snapshot
 
         base_df = lot_ids = options = None
@@ -1640,8 +1650,16 @@ def refresh_data() -> GallerySnapshot:
                     "App image table is still loading; showing Odoo images until it is ready. "
                     "If this keeps happening, compact the table (see build_product_gallery_table.py)."
                 )
-        df = (_timed(timings, "apply app images", apply_app_images, base_df, uploads, lot_ids)
-              if uploads is not None else base_df)
+        if uploads is not None:
+            df, matched_lots = _timed(timings, "apply app images", apply_app_images, base_df, uploads, lot_ids)
+        else:
+            df, matched_lots = base_df, None
+        uploads_info = {
+            "read": None if uploads is None else len(uploads),
+            "matched_lots": matched_lots,
+            "error": store.uploads_error,
+            "checked_at": images_at or None,
+        }
         log.info(
             "data refresh done in %.1fs (%s)", time.perf_counter() - started,
             ", ".join(f"{name} {secs:.1f}s" for name, secs in timings.items()),
@@ -1649,6 +1667,7 @@ def refresh_data() -> GallerySnapshot:
         store.snapshot = GallerySnapshot(
             df=df, base_df=base_df, lot_ids=lot_ids, options=options, version=version,
             built_at=built_at, images_at=images_at, checked_at=checked_at,
+            uploads_info=uploads_info,
         )
         return store.snapshot
 
@@ -1732,17 +1751,18 @@ def apply_filters(df, f):
 
 
 def lot_counts(df: pd.DataFrame) -> dict:
-    """Lot counts for the (filtered) rows, using the same rules as the
-    lot-coverage query: a lot is company + product + lot number, counted once
-    however many locations it is in, and only if at least one of its rows has
-    quantity > 0. A lot's image is the same on all its rows (it is decided
-    per product + lot), so "with photo" + "pending" always add up to "lots"."""
-    in_stock = df[(df["available_inventory"].fillna(0) > 0) & df["_lot_count_key"].notna()]
-    has_image = in_stock["image_1920"] != NO_IMAGE
+    """Lot counts for the rows the filters left: a lot is company + product +
+    lot number, counted once however many locations it is in. No stock
+    condition here - the "In stock only" filter decides that, so with it
+    ticked the counts match the lot-coverage query (quantity > 0). A lot's
+    image is the same on all its rows (it is decided per product + lot), so
+    "with photo" + "pending" always add up to "lots"."""
+    lots = df[df["_lot_count_key"].notna()]
+    has_image = lots["image_1920"] != NO_IMAGE
     return {
-        "lots": int(in_stock["_lot_count_key"].nunique()),
-        "with_photo": int(in_stock.loc[has_image, "_lot_count_key"].nunique()),
-        "pending": int(in_stock.loc[~has_image, "_lot_count_key"].nunique()),
+        "lots": int(lots["_lot_count_key"].nunique()),
+        "with_photo": int(lots.loc[has_image, "_lot_count_key"].nunique()),
+        "pending": int(lots.loc[~has_image, "_lot_count_key"].nunique()),
     }
 
 
@@ -2002,12 +2022,35 @@ def render_card_html(item, img, loading: bool = False) -> str:
     """
 
 
+def _uploads_status_text(info: dict) -> str:
+    """One line about the app-upload table, so it is visible on screen whether
+    uploads were read and matched (and why not, if a read failed)."""
+    if not info:
+        return ""
+    error = info.get("error")
+    if error:   # never show storage locations
+        error = re.sub(r"(?:abfss|https?)://\S+|\S*@onelake\.\S+", "", error).strip(" :,-") or "read error"
+    if info.get("read") is None:
+        return "App uploads: still loading" + (f" · last read failed: {error}" if error else "")
+    text = f"App uploads: {info['read']:,} read · {info.get('matched_lots') or 0:,} lots matched"
+    if info.get("checked_at"):
+        try:
+            tz = ZoneInfo(secret("APP_TIMEZONE", "Asia/Kolkata") or "Asia/Kolkata")
+        except Exception:
+            tz = ZoneInfo("Asia/Kolkata")
+        text += f" · checked {datetime.fromtimestamp(info['checked_at'], tz):%d %b %H:%M}"
+    if error:
+        text += f" · last read failed: {error}"
+    return text
+
+
 def _change_page(delta: int):
     st.session_state.page = st.session_state.get("page", 1) + delta
 
 
 @st.fragment
-def render_results(df: pd.DataFrame, cols_per_row: int):
+def render_results(df: pd.DataFrame, cols_per_row: int, uploads_info: dict = None,
+                   in_stock_only: bool = False):
     """Product grid + pager. A fragment: Previous/Next re-run only this part,
     not the filters, data lookup and the rest of the page."""
     total = len(df)
@@ -2027,16 +2070,24 @@ def render_results(df: pd.DataFrame, cols_per_row: int):
              time.perf_counter() - images_started,
              f" ({len(pending)} still loading, shown as they arrive)" if pending else "")
 
-    # Lots, not rows: same rules as the lot-coverage query (company + product +
-    # lot, quantity > 0), so the numbers match it for the same filters.
+    # Lots, not rows (company + product + lot). With "In stock only" ticked
+    # these match the lot-coverage query, which counts quantity > 0 only.
     counts = lot_counts(df)
+    lots_label = "in stock" if in_stock_only else "(in stock and out of stock)"
     st.markdown(
         f"<div style='color: var(--muted-text); font-size:13px; margin-bottom:8px;'>"
-        f"<b style='color: var(--panel-text);'>{counts['lots']:,} lot{'s' if counts['lots'] != 1 else ''} in stock</b>"
+        f"<b style='color: var(--panel-text);'>{counts['lots']:,} lot{'s' if counts['lots'] != 1 else ''}</b> {lots_label}"
         f" · {counts['with_photo']:,} with photo · {counts['pending']:,} pending"
         f" · {total:,} card{'s' if total != 1 else ''}</div>",
         unsafe_allow_html=True,
     )
+    uploads_line = _uploads_status_text(uploads_info)
+    if uploads_line:
+        st.markdown(
+            f"<div style='color: var(--muted-text); font-size:11.5px; margin:-4px 0 8px 0;'>"
+            f"{html_lib.escape(uploads_line)}</div>",
+            unsafe_allow_html=True,
+        )
     status = st.empty()
 
     if total == 0:
@@ -2145,14 +2196,16 @@ def main():
         filters = render_filters(filter_options, "mobile_filter_panel")
         reset_page_if_filters_changed(filters)
         with st.container():
-            render_results(apply_filters(full_df, filters), filters["cols_per_row"])
+            render_results(apply_filters(full_df, filters), filters["cols_per_row"], snap.uploads_info,
+                           filters["in_stock_only"])
     else:
         filter_col, results_col = st.columns([1.25, 3])
         with filter_col:
             filters = render_filters(filter_options, "filter_panel")
         reset_page_if_filters_changed(filters)
         with results_col:
-            render_results(apply_filters(full_df, filters), filters["cols_per_row"])
+            render_results(apply_filters(full_df, filters), filters["cols_per_row"], snap.uploads_info,
+                           filters["in_stock_only"])
 
     # Time the server spent building this page. If the browser takes much
     # longer than this to show it, the delay is in the browser / network.
