@@ -2032,7 +2032,7 @@ def _uploads_status_text(info: dict) -> str:
         error = re.sub(r"(?:abfss|https?)://\S+|\S*@onelake\.\S+", "", error).strip(" :,-") or "read error"
     if info.get("read") is None:
         return "App uploads: still loading" + (f" · last read failed: {error}" if error else "")
-    text = f"App uploads: {info['read']:,} read · {info.get('matched_lots') or 0:,} lots matched"
+    # text = f"App uploads: {info['read']:,} read · {info.get('matched_lots') or 0:,} lots matched"
     if info.get("checked_at"):
         try:
             tz = ZoneInfo(secret("APP_TIMEZONE", "Asia/Kolkata") or "Asia/Kolkata")
