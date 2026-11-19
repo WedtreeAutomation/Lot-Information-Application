@@ -12,6 +12,7 @@ import logging
 import threading
 import time
 import warnings
+import zipfile
 import html as html_lib
 from io import BytesIO
 from datetime import date, datetime
@@ -374,6 +375,19 @@ def inject_theme():
         .stButton > button:disabled {{
             background-color: #E7D3D8;
             color: #ffffff;
+        }}
+        .stDownloadButton > button {{
+            background-color: var(--brand-3);
+            color: #ffffff;
+            border: none;
+            border-radius: 999px;
+            padding: 8px 20px;
+            font-weight: 600;
+        }}
+        .stDownloadButton > button:hover {{
+            background-color: var(--brand-1);
+            color: #ffffff;
+            box-shadow: 0 3px 10px rgba(158,79,104,0.35);
         }}
 
         .product-card {{
@@ -1284,6 +1298,13 @@ def build_base_inventory():
     # Re-apply the company exclusions: the gallery table may have been built
     # with an older EXCLUDED_COMPANIES list.
     plan = plan.filter(~pl.col("company").is_in(sorted(EXCLUDED_COMPANIES)))
+    # Only the companies in COMPANY_LABELS are shown anywhere in the app (cards,
+    # filters, counts, Excel export). Others in the data (e.g. "Wedtree - HSR",
+    # "Wedtree Lifestyle Private Limited - CPI") are left out - add them to
+    # COMPANY_LABELS to show them.
+    plan = plan.with_columns(pl.col("company").replace(COMPANY_LABELS)).filter(
+        pl.col("company").is_in(sorted(set(COMPANY_LABELS.values())))
+    )
 
     lot_text = pl.col("lot_number").cast(pl.Utf8).fill_null("").str.strip_chars()
     plan = plan.with_columns(
@@ -2048,6 +2069,271 @@ def _change_page(delta: int):
     st.session_state.page = st.session_state.get("page", 1) + delta
 
 
+# ===========================================================
+# Excel export of the filtered rows - two sheets:
+#   "Lots by Location": Company, Location, Total Lots, With Photo, Pending
+#   "Lot Details":      Lot No, Company, Location, SKU, Product Name, Qty, Value, Age, Has Photo
+# Lots are counted like the line above the cards (company + product + lot
+# number); rows without a lot number are left out. The file is written with
+# the Python standard library only (see write_xlsx) - no Excel package needed.
+# ===========================================================
+XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+# Newer Streamlit runs a callable `data` only when the button is clicked.
+DEFERRED_DOWNLOAD = "callable" in (st.download_button.__doc__ or "")
+
+
+def location_lot_summary(df: pd.DataFrame) -> pd.DataFrame:
+    lots = df[df["_lot_count_key"].notna()]
+    key = lots["_lot_count_key"]
+    has_photo = lots["image_1920"] != NO_IMAGE
+    return (
+        pd.DataFrame({
+            "Company": lots["company"].fillna("(no company)"),
+            "Location": lots["location"].fillna("(no location)"),
+            "lot": key,
+            "photo": key.where(has_photo),
+            "pending": key.where(~has_photo),
+        })
+        .groupby(["Company", "Location"], sort=True)
+        .agg(**{"Total Lots": ("lot", "nunique"), "With Photo": ("photo", "nunique"),
+                "Pending": ("pending", "nunique")})
+        .reset_index()
+    )
+
+
+def lot_details(df: pd.DataFrame) -> pd.DataFrame:
+    lots = df[df["_lot_count_key"].notna()]
+    return pd.DataFrame({
+        "Lot No": lots["lot_number"],
+        "Company": lots["company"],
+        "Location": lots["location"],
+        "SKU": lots["sku"],
+        "Product Name": lots["product_name"],
+        "Qty": lots["available_inventory"],
+        "Value": lots["available_selling_price"],
+        "Age": lots["overall_age"],
+        "Has Photo": (lots["image_1920"] != NO_IMAGE).map({True: "Yes", False: "No"}),
+    }).sort_values(["Company", "Location", "SKU", "Lot No"], kind="stable", na_position="last")
+
+
+NUMERIC_EXPORT_COLS = {"Total Lots", "With Photo", "Pending", "Qty", "Value", "Age"}
+
+# --- Minimal .xlsx writer (Python standard library only) --------------------
+# An .xlsx file is a zip of a few XML files. Writing them directly needs no
+# extra package (nothing to pip install) and builds a whole column at a time,
+# which is faster than xlsxwriter/openpyxl writing cell by cell.
+_XML_HEAD = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+_NS_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+_NS_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+_XML_BAD_CHARS = r"[\x00-\x08\x0b\x0c\x0e-\x1f￾￿]"
+# cell styles (see _XLSX_STYLES): 0 normal, 1 bold, 2 "#,##0", 3 bold "#,##0"
+_XLSX_STYLES = (
+    _XML_HEAD + f'<styleSheet xmlns="{_NS_MAIN}">'
+    '<fonts count="2"><font><sz val="11"/><name val="Calibri"/><family val="2"/></font>'
+    '<font><b/><sz val="11"/><name val="Calibri"/><family val="2"/></font></fonts>'
+    '<fills count="2"><fill><patternFill patternType="none"/></fill>'
+    '<fill><patternFill patternType="gray125"/></fill></fills>'
+    '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>'
+    '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+    '<cellXfs count="4">'
+    '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+    '<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
+    '<xf numFmtId="3" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>'
+    '<xf numFmtId="3" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1" applyNumberFormat="1"/>'
+    '</cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
+    '</styleSheet>'
+)
+
+
+def _col_letter(index: int) -> str:
+    letters = ""
+    index += 1
+    while index:
+        index, rem = divmod(index - 1, 26)
+        letters = chr(65 + rem) + letters
+    return letters
+
+
+def _xml_text(values: pd.Series) -> pd.Series:
+    return (values.astype(str).str.replace(_XML_BAD_CHARS, "", regex=True)
+            .str.replace("&", "&amp;", regex=False).str.replace("<", "&lt;", regex=False)
+            .str.replace(">", "&gt;", regex=False))
+
+
+def _xlsx_cell_column(values: pd.Series, letter: str, row_numbers: pd.Series, numeric: bool) -> pd.Series:
+    """The <c> element of every row of one column (empty text for a blank cell)."""
+    if numeric:
+        nums = pd.to_numeric(values, errors="coerce").astype("float64")
+        nums = nums.where(nums.abs() != float("inf"))
+        missing = nums.isna()
+        body = nums.map(repr)          # shortest exact form, e.g. 12.5, 3.0, 1e+20
+        cells = f'<c r="{letter}' + row_numbers + '" s="2"><v>' + body + "</v></c>"
+    else:
+        missing = values.isna()
+        cells = (f'<c r="{letter}' + row_numbers + '" t="inlineStr"><is><t xml:space="preserve">'
+                 + _xml_text(values.astype(object)) + "</t></is></c>")
+    return cells.mask(missing, "")
+
+
+def _xlsx_inline_row(row: int, values, numeric_flags, styles=(1, 3)) -> str:
+    """One small row (header / TOTAL) written cell by cell."""
+    text_style, num_style = styles
+    cells = []
+    for i, (value, numeric) in enumerate(zip(values, numeric_flags)):
+        ref = f"{_col_letter(i)}{row}"
+        if value is None or value == "":
+            continue
+        if numeric and isinstance(value, (int, float)):
+            cells.append(f'<c r="{ref}" s="{num_style}"><v>{value!r}</v></c>')
+        else:
+            text = html_lib.escape(re.sub(_XML_BAD_CHARS, "", str(value)), quote=False)
+            cells.append(f'<c r="{ref}" s="{text_style}" t="inlineStr"><is><t xml:space="preserve">{text}</t></is></c>')
+    return f'<row r="{row}">{"".join(cells)}</row>'
+
+
+def _xlsx_sheet(frame: pd.DataFrame, widths, total_row=None) -> str:
+    frame = frame.reset_index(drop=True)
+    n_rows, n_cols = frame.shape
+    numeric = [c in NUMERIC_EXPORT_COLS for c in frame.columns]
+    parts = [_xlsx_inline_row(1, list(frame.columns), [False] * n_cols)]
+    if n_rows:
+        row_numbers = pd.Series(range(2, n_rows + 2)).astype(str)
+        rows = '<row r="' + row_numbers + '">'
+        for i, col in enumerate(frame.columns):
+            rows = rows + _xlsx_cell_column(frame[col], _col_letter(i), row_numbers, numeric[i])
+        parts.append("".join((rows + "</row>").tolist()))
+    if total_row:
+        parts.append(_xlsx_inline_row(n_rows + 2, total_row, numeric))
+    cols = "".join(f'<col min="{i}" max="{i}" width="{w}" customWidth="1"/>'
+                   for i, w in enumerate(widths, start=1))
+    last = f"{_col_letter(n_cols - 1)}{max(n_rows, 1) + 1}"
+    return (
+        _XML_HEAD + f'<worksheet xmlns="{_NS_MAIN}" xmlns:r="{_NS_REL}">'
+        '<sheetViews><sheetView workbookViewId="0">'
+        '<pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/>'
+        '<selection pane="bottomLeft" activeCell="A2" sqref="A2"/></sheetView></sheetViews>'
+        f'<sheetFormatPr defaultRowHeight="15"/><cols>{cols}</cols>'
+        f'<sheetData>{"".join(parts)}</sheetData><autoFilter ref="A1:{last}"/></worksheet>'
+    ), last
+
+
+def write_xlsx(sheets) -> bytes:
+    """sheets: [(name, DataFrame, column widths, total row or None)] -> .xlsx bytes."""
+    sheet_entries, defined_names, rels, overrides = [], [], [], []
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, compresslevel=3) as zf:
+        for i, (name, frame, widths, total_row) in enumerate(sheets, start=1):
+            xml, last = _xlsx_sheet(frame, widths, total_row)
+            zf.writestr(f"xl/worksheets/sheet{i}.xml", xml)
+            safe = html_lib.escape(name)
+            sheet_entries.append(f'<sheet name="{safe}" sheetId="{i}" r:id="rId{i}"/>')
+            ref = "$" + "$".join(re.match(r"([A-Z]+)(\d+)", last).groups())
+            defined_names.append(f'<definedName name="_xlnm._FilterDatabase" localSheetId="{i - 1}" '
+                                 f'hidden="1">\'{safe}\'!$A$1:{ref}</definedName>')
+            rels.append(f'<Relationship Id="rId{i}" Type="{_NS_REL}/worksheet" '
+                        f'Target="worksheets/sheet{i}.xml"/>')
+            overrides.append(f'<Override PartName="/xl/worksheets/sheet{i}.xml" ContentType='
+                             '"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>')
+        rels.append(f'<Relationship Id="rIdStyles" Type="{_NS_REL}/styles" Target="styles.xml"/>')
+        zf.writestr("xl/styles.xml", _XLSX_STYLES)
+        zf.writestr("xl/workbook.xml", _XML_HEAD + f'<workbook xmlns="{_NS_MAIN}" xmlns:r="{_NS_REL}">'
+                    f'<sheets>{"".join(sheet_entries)}</sheets>'
+                    f'<definedNames>{"".join(defined_names)}</definedNames></workbook>')
+        zf.writestr("xl/_rels/workbook.xml.rels", _XML_HEAD +
+                    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                    + "".join(rels) + "</Relationships>")
+        zf.writestr("_rels/.rels", _XML_HEAD +
+                    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                    f'<Relationship Id="rId1" Type="{_NS_REL}/officeDocument" Target="xl/workbook.xml"/>'
+                    "</Relationships>")
+        zf.writestr("[Content_Types].xml", _XML_HEAD +
+                    '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+                    '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+                    '<Default Extension="xml" ContentType="application/xml"/>'
+                    '<Override PartName="/xl/workbook.xml" ContentType='
+                    '"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+                    '<Override PartName="/xl/styles.xml" ContentType='
+                    '"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+                    + "".join(overrides) + "</Types>")
+    return buf.getvalue()
+
+
+def build_lot_export(df: pd.DataFrame) -> bytes:
+    started = time.perf_counter()
+    summary, details, counts = location_lot_summary(df), lot_details(df), lot_counts(df)
+    total_row = ["TOTAL", "", counts["lots"], counts["with_photo"], counts["pending"]]
+    data = write_xlsx([  # name, frame, column widths, total row (TOTAL counts each lot once)
+        ("Lots by Location", summary, [18, 34, 12, 12, 10], total_row),
+        ("Lot Details", details, [18, 16, 34, 18, 44, 8, 12, 8, 10], None),
+    ])
+    log.info("Excel export: %d locations, %d lots, %d KB in %.1fs", len(summary),
+             len(details), len(data) // 1024, time.perf_counter() - started)
+    return data
+
+
+def render_excel_export(df: pd.DataFrame):
+    try:
+        tz = ZoneInfo(secret("APP_TIMEZONE", "Asia/Kolkata") or "Asia/Kolkata")
+    except Exception:
+        tz = ZoneInfo("Asia/Kolkata")
+    file_name = f"lot_photo_report_{datetime.now(tz):%Y%m%d_%H%M}.xlsx"
+    # A plain dict kept in session state: the export runs outside the page
+    # script, so a failure is recorded here and shown on the next rerun
+    # (Streamlit itself only says "Failed to generate file for download").
+    status = st.session_state.setdefault("_export_status", {})
+
+    def make_file():
+        try:
+            return build_lot_export(df)
+        except Exception as exc:
+            log.exception("Excel export failed")
+            status["error"] = f"{type(exc).__name__}: {exc}"
+            raise
+
+    if DEFERRED_DOWNLOAD:
+        # Built only on click, with the filters on screen; no page rerun after.
+        st.download_button("⬇ Export Excel", data=make_file, file_name=file_name,
+                           mime=XLSX_MIME, key="export_xlsx", on_click="ignore",
+                           width="stretch", disabled=df.empty)
+        return
+    # Older Streamlit: build on click, then offer the file.
+    filter_key = st.session_state.get("_filter_key")
+    if st.button("⬇ Export Excel", key="export_build", width="stretch", disabled=df.empty):
+        with st.spinner("Preparing…"):
+            try:
+                st.session_state["_export_xlsx"] = (filter_key, make_file(), file_name)
+            except Exception:
+                pass          # shown by render_summary_bar
+    ready = st.session_state.get("_export_xlsx")
+    if ready and ready[0] == filter_key:
+        st.download_button("Download file", ready[1], file_name=ready[2], mime=XLSX_MIME,
+                           key="export_xlsx", width="stretch")
+
+
+def render_summary_bar(df: pd.DataFrame, in_stock_only: bool = False):
+    """Lot counts + Excel export, above the cards. Kept OUTSIDE the
+    render_results fragment, which re-runs while slow images arrive."""
+    # Lots, not rows (company + product + lot). With "In stock only" ticked
+    # these match the lot-coverage query, which counts quantity > 0 only.
+    counts = lot_counts(df)
+    total = len(df)
+    lots_label = "in stock" if in_stock_only else "(in stock and out of stock)"
+    counts_col, export_col = st.columns([4, 1], vertical_alignment="center")
+    with counts_col:
+        st.markdown(
+            f"<div style='color: var(--muted-text); font-size:13px; margin-bottom:8px;'>"
+            f"<b style='color: var(--panel-text);'>{counts['lots']:,} lot{'s' if counts['lots'] != 1 else ''}</b> {lots_label}"
+            f" · {counts['with_photo']:,} with photo · {counts['pending']:,} pending"
+            f" · {total:,} card{'s' if total != 1 else ''}</div>",
+            unsafe_allow_html=True,
+        )
+    with export_col:
+        render_excel_export(df)
+    error = st.session_state.get("_export_status", {}).pop("error", None)
+    if error:
+        st.error(f"Excel export failed: {error}")
+
+
 @st.fragment
 def render_results(df: pd.DataFrame, cols_per_row: int, uploads_info: dict = None,
                    in_stock_only: bool = False):
@@ -2070,17 +2356,6 @@ def render_results(df: pd.DataFrame, cols_per_row: int, uploads_info: dict = Non
              time.perf_counter() - images_started,
              f" ({len(pending)} still loading, shown as they arrive)" if pending else "")
 
-    # Lots, not rows (company + product + lot). With "In stock only" ticked
-    # these match the lot-coverage query, which counts quantity > 0 only.
-    counts = lot_counts(df)
-    lots_label = "in stock" if in_stock_only else "(in stock and out of stock)"
-    st.markdown(
-        f"<div style='color: var(--muted-text); font-size:13px; margin-bottom:8px;'>"
-        f"<b style='color: var(--panel-text);'>{counts['lots']:,} lot{'s' if counts['lots'] != 1 else ''}</b> {lots_label}"
-        f" · {counts['with_photo']:,} with photo · {counts['pending']:,} pending"
-        f" · {total:,} card{'s' if total != 1 else ''}</div>",
-        unsafe_allow_html=True,
-    )
     uploads_line = "" #_uploads_status_text(uploads_info)
     if uploads_line:
         st.markdown(
@@ -2196,7 +2471,9 @@ def main():
         filters = render_filters(filter_options, "mobile_filter_panel")
         reset_page_if_filters_changed(filters)
         with st.container():
-            render_results(apply_filters(full_df, filters), filters["cols_per_row"], snap.uploads_info,
+            filtered = apply_filters(full_df, filters)
+            render_summary_bar(filtered, filters["in_stock_only"])
+            render_results(filtered, filters["cols_per_row"], snap.uploads_info,
                            filters["in_stock_only"])
     else:
         filter_col, results_col = st.columns([1.25, 3])
@@ -2204,7 +2481,9 @@ def main():
             filters = render_filters(filter_options, "filter_panel")
         reset_page_if_filters_changed(filters)
         with results_col:
-            render_results(apply_filters(full_df, filters), filters["cols_per_row"], snap.uploads_info,
+            filtered = apply_filters(full_df, filters)
+            render_summary_bar(filtered, filters["in_stock_only"])
+            render_results(filtered, filters["cols_per_row"], snap.uploads_info,
                            filters["in_stock_only"])
 
     # Time the server spent building this page. If the browser takes much
