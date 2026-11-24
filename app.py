@@ -4,23 +4,28 @@ import asyncio
 if sys.platform.startswith("win") and sys.version_info < (3, 14):
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
+import atexit
 import base64
+import faulthandler
+import json
+import os
 import re
 import hashlib
 import hmac
+import inspect
 import logging
 import threading
 import time
-import warnings
+import uuid
 import zipfile
 import html as html_lib
 from io import BytesIO
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from zoneinfo import ZoneInfo
-from dataclasses import dataclass, field, replace
-from urllib.parse import urlparse
+from dataclasses import dataclass, replace
+from urllib.parse import unquote, urlparse
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout, wait as wait_futures
+from concurrent.futures import ThreadPoolExecutor, wait as wait_futures
 
 import pandas as pd
 import polars as pl
@@ -73,30 +78,28 @@ MAX_WORKERS = 20
 CARD_IMAGE_MAX_PX = 600   # card thumbnails sent to the browser; originals stay untouched in OneLake
 THUMB_DIR = "_gallery_thumbnails"   # saved thumbnails: <lakehouse>/Files/_gallery_thumbnails/w600/...
 IMAGE_CACHE_ENTRIES = 2000          # thumbnails kept in memory (~40 KB each)
+IMAGE_CACHE_TTL_SECONDS = 60 * 60 * 24
 
 # ---------------------------------------------------------------
-# Data freshness
+# Data freshness - the gallery refreshes whenever something changes
 # ---------------------------------------------------------------
-# The inventory is built in a BACKGROUND thread and swapped in when ready
-# (stale-while-revalidate): users always get the last good copy instantly
-# and never wait for a rebuild. Only the very first load after the app
-# starts (e.g. Streamlit Cloud waking from sleep) has to wait.
-#
-# Rebuild triggers:
-#   * a source Delta table got a new version (checked every VERSION_CHECK_SECONDS),
-#     so the nightly ETL shows up within minutes instead of up to a day later;
-#   * DATA_TTL_SECONDS passed since the last build (safety net).
-DATA_TTL_SECONDS = 60 * 60 * 24        # 1 day
-VERSION_CHECK_SECONDS = 10 * 60        # how often to look for new table versions
-REFRESH_CHECK_SECONDS = 60             # background loop tick
-
-# Images uploaded in the upload app are recorded in this SILVER table (one row
-# per lot: id, product_id, image_path, uploaded_at, uploaded_by). It is small,
-# so it is re-read far more often than the inventory: new uploads show up in
-# the report within this many seconds.
-APP_IMAGES_TTL_SECONDS = 5 * 60
-APP_IMAGES_WAIT_SECONDS = 15        # first load waits at most this long for the uploads table,
-                                    # so the first counts already include app uploads
+# One background thread checks every CHANGE_CHECK_SECONDS whether any source
+# table has a new commit. That check is one tiny "does the next log file
+# exist?" request per table - it never opens the table - so it is cheap even
+# for tables with a very long history. Only a table that changed is re-read:
+#   gallery table / Odoo tables (new or updated records) -> full rebuild
+#   product_images (Odoo images, photo deletes)          -> lot images re-read
+#   product_image_overrides (upload app)                 -> just the new uploads read
+#   product_image_deletions (photo delete, any computer) -> deletions re-read
+# Users keep seeing the last good data while a refresh runs, and open pages
+# redraw by themselves within LIVE_UPDATE_SECONDS.
+CHANGE_CHECK_SECONDS = 5
+LIVE_UPDATE_SECONDS = 5
+FULL_REBUILD_SECONDS = 60 * 60 * 24     # safety net: a full rebuild at least once a day
+HEARTBEAT_SECONDS = 5 * 60              # "still running" line (memory, rows) in the terminal
+HIDE_GRACE_SECONDS = 60                 # a deleted photo stays hidden this long after it was saved
+INCREMENTAL_MAX_COMMITS = 200           # more new upload commits than this -> re-read the whole table
+FIRST_LOAD_TIMEOUT_SECONDS = 15 * 60
 NO_IMAGE = "No image available"
 
 WARMUP_PREFETCH_PAGES = 2          # first gallery pages whose images are pre-loaded
@@ -116,6 +119,69 @@ if not log.handlers:   # the script re-runs on every interaction; add the handle
     log.addHandler(_handler)
     log.setLevel(logging.INFO)
     log.propagate = False
+
+# ===========================================================
+# Crash diagnostics - everything goes to the terminal the app runs in
+#   * a native crash (in polars / deltalake / Azure code) prints the Python
+#     stack of every thread (faulthandler) instead of the app just vanishing
+#   * an error in a background thread is logged with its traceback
+#   * a normal shutdown logs "app process exiting" - if the app disappears
+#     WITHOUT that line and without a faulthandler dump, the process was
+#     killed from outside (e.g. out of memory)
+#   * a heartbeat every HEARTBEAT_SECONDS logs memory use and data size
+# ===========================================================
+def _process_memory_mb():
+    try:
+        import psutil
+        return psutil.Process().memory_info().rss / 2**20
+    except Exception:
+        pass
+    if sys.platform.startswith("win"):
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class _Counters(ctypes.Structure):
+                _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                            ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                            ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                            ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t)]
+
+            counters = _Counters()
+            counters.cb = ctypes.sizeof(_Counters)
+            kernel32 = ctypes.windll.kernel32
+            kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+            ctypes.windll.psapi.GetProcessMemoryInfo(kernel32.GetCurrentProcess(), ctypes.byref(counters),
+                                                     counters.cb)
+            return counters.WorkingSetSize / 2**20
+        except Exception:
+            return None
+    try:
+        import resource
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024     # peak, Linux
+    except Exception:
+        return None
+
+
+def _memory_text() -> str:
+    mb = _process_memory_mb()
+    return f"{mb:,.0f} MB" if mb is not None else "n/a"
+
+
+if not getattr(sys, "_product_gallery_diagnostics", False):    # this file re-runs on every click
+    sys._product_gallery_diagnostics = True
+    faulthandler.enable(all_threads=True)
+
+    def _log_thread_exception(args):
+        log.error("Uncaught error in thread %s", getattr(args.thread, "name", "?"),
+                  exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+
+    threading.excepthook = _log_thread_exception
+    atexit.register(lambda: log.info("app process exiting normally (memory %s)", _memory_text()))
+    log.info("app process started - pid %s, Python %s, polars %s, memory %s",
+             os.getpid(), sys.version.split()[0], pl.__version__, _memory_text())
 
 # ===========================================================
 # Fabric / OneLake connection details - read from Streamlit secrets.
@@ -156,7 +222,7 @@ COMPANY_LABELS = {
 }
 
 # Same list as the lot-coverage query. The pre-joined gallery table may have been
-# built with an older list, so build_base_inventory re-applies this one.
+# built with an older list, so load_inventory_rows re-applies this one.
 EXCLUDED_COMPANIES = {
     "Saree Trails",
     "Wedtree eStore Private Limited - Online",
@@ -375,6 +441,21 @@ def inject_theme():
         .stButton > button:disabled {{
             background-color: #E7D3D8;
             color: #ffffff;
+        }}
+        [class*="st-key-del_"] {{ margin-top: -14px; margin-bottom: 18px; }}
+        [class*="st-key-del_"] button {{
+            background: transparent;
+            color: var(--danger-text);
+            border: 1px solid var(--card-border);
+            padding: 4px 12px;
+            min-height: 0;
+            font-size: 12.5px;
+            font-weight: 600;
+        }}
+        [class*="st-key-del_"] button:hover {{
+            background: var(--danger-bg);
+            color: var(--danger-text);
+            box-shadow: none;
         }}
         .stDownloadButton > button {{
             background-color: var(--brand-3);
@@ -995,7 +1076,7 @@ def _load_card_image(store: _ImageStore, client, ref: str):
 def _load_and_remember(store: _ImageStore, client, ref: str):
     result = _load_card_image(store, client, ref)
     # Failures are retried after a few minutes instead of on every rerun.
-    ttl = DATA_TTL_SECONDS if result[0] is not None else 5 * 60
+    ttl = IMAGE_CACHE_TTL_SECONDS if result[0] is not None else 5 * 60
     with store.lock:
         store.cache[ref] = (time.time() + ttl, result)
         store.cache.move_to_end(ref)
@@ -1207,258 +1288,293 @@ def _inventory_plan_from_gold() -> pl.LazyFrame:
     )
 
 
-def _source_tables():
-    if GALLERY_TABLE:
-        # product_images too: lot images are read live from it (see
-        # build_base_inventory), so an ETL load of new images or new lot
-        # records triggers a rebuild even before the gallery table is rebuilt.
-        return [(GALLERY_TABLE_SCHEMA, GALLERY_TABLE), ("Odoo", "product_images")]
-    return [("Odoo", name) for name in ODOO_SOURCE_TABLES]
+# ===========================================================
+# Change detection - plain HTTP requests, the Delta library isn't involved.
+# A Delta table's history is a folder of numbered commit files
+# (_delta_log/00000000000000000042.json). "Has the table changed since
+# version N?" is simply "does file N+1 exist?" - one small request, however
+# long the history is.
+# ===========================================================
+def _log_location(schema: str, table: str):
+    return workspace_id, f"{lakehouse_id_silver}/Tables/{schema}/{table}/_delta_log"
 
 
-def delta_version(uri: str) -> int:
-    """Current Delta version of one table - reads only the transaction log."""
-    from deltalake import DeltaTable
-    # without_files skips loading the file list on deltalake 0.x; newer
-    # versions ignore it (with a DeprecationWarning) or don't accept it.
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        try:
-            return DeltaTable(uri, storage_options=storage_options, without_files=True).version()
-        except TypeError:
-            return DeltaTable(uri, storage_options=storage_options).version()
-
-
-def source_version():
-    """Delta version of each source table. Returns None if it can't be read
-    (then only the TTL applies)."""
+def _commit_exists(location, version: int) -> bool:
+    filesystem, log_dir = location
     try:
-        return tuple(
-            delta_version(table_uri(lakehouse_id_silver, schema, table))
-            for schema, table in _source_tables()
-        )
-    except Exception:
-        log.warning("Couldn't read source table versions", exc_info=True)
+        _file_client(get_datalake_service_client(), filesystem,
+                     f"{log_dir}/{version:020d}.json").get_file_properties()
+        return True
+    except ResourceNotFoundError:
+        return False
+
+
+def _last_checkpoint_version(location):
+    filesystem, log_dir = location
+    try:
+        raw = _file_client(get_datalake_service_client(), filesystem,
+                           f"{log_dir}/_last_checkpoint").download_file().readall()
+        return int(json.loads(raw)["version"])
+    except ResourceNotFoundError:
         return None
 
 
-def load_product_images_index() -> pl.DataFrame:
-    """Live Odoo.product_images with the same rows and rules as the
-    lot-coverage query: one row per id, with
-      pi_id       the product_images id (text)
-      _img_key    product_id|UPPER(TRIM(name))  - the lot, across companies
-      odoo_image  the Odoo image path, or null when blank/False/None/null"""
-    started = time.perf_counter()
-    lot_name = pl.col("name").cast(pl.Utf8).str.strip_chars()
-    index = (
-        _scan(lakehouse_id_silver, "Odoo", "product_images", ["id", "name", "product_id", "image_1920"])
-        .filter(pl.col("id").is_not_null() & lot_name.is_not_null() & (lot_name != ""))
-        .select(
-            _id_text(pl.col("id")).alias("pi_id"),
-            pl.concat_str(
-                [_id_text(pl.col("product_id")), lot_name.str.to_uppercase()],
-                separator="|",
-            ).alias("_img_key"),
-            pl.col("image_1920").cast(pl.Utf8).str.strip_chars().alias("odoo_image"),
-        )
-        .filter(pl.col("_img_key").is_not_null())
-        .with_columns(
-            pl.when(
-                pl.col("odoo_image").is_null()
-                | pl.col("odoo_image").str.to_lowercase().is_in(["", "false", "none", "null"])
-            ).then(None).otherwise(pl.col("odoo_image")).alias("odoo_image")
-        )
-        .collect()
-    )
-    log.info("product_images read live: %d rows in %.1fs", index.height, time.perf_counter() - started)
-    return index
+def latest_version(location, known=None):
+    """Latest commit version of a Delta table, or None if the table doesn't
+    exist (yet). With `known` - the version seen last time - an unchanged
+    table costs exactly one request."""
+    if known is not None:
+        if not _commit_exists(location, known + 1):
+            return known
+        low = known + 1
+    else:
+        low = _last_checkpoint_version(location)      # a version that certainly exists
+        if low is None:
+            if not _commit_exists(location, 0):
+                return None
+            low = 0
+    step = 1                                          # gallop forward, then halve
+    while _commit_exists(location, low + step):
+        low += step
+        step *= 2
+    high = low + step
+    while high - low > 1:
+        mid = (low + high) // 2
+        if _commit_exists(location, mid):
+            low = mid
+        else:
+            high = mid
+    return low
 
 
-def _lot_ids_from_pi_ids(df: pd.DataFrame) -> pd.DataFrame:
-    """Fallback when product_images can't be read: the ids stored in the
-    gallery table's pi_ids column (pi_id, _img_key)."""
-    ids = df[["_img_key", "pi_ids"]].dropna(subset=["_img_key"])
-    ids = ids.assign(pi_id=ids["pi_ids"].astype(str).str.split(",")).explode("pi_id")
-    ids["pi_id"] = ids["pi_id"].fillna("").str.strip().str.replace(r"\.0+$", "", regex=True)
-    return ids.loc[ids["pi_id"] != "", ["pi_id", "_img_key"]].drop_duplicates().reset_index(drop=True)
+def watched_tables() -> dict:
+    """name -> (kind of change, log location)."""
+    tables = {}
+    if GALLERY_TABLE:
+        tables[GALLERY_TABLE] = ("inventory", _log_location(GALLERY_TABLE_SCHEMA, GALLERY_TABLE))
+    else:
+        for name in ODOO_SOURCE_TABLES:
+            if name != "product_images":
+                tables[name] = ("inventory", _log_location("Odoo", name))
+    tables["product_images"] = ("images", _log_location("Odoo", "product_images"))
+    tables["uploads"] = ("uploads", _log_location("Odoo", app_images_table_name()))
+    tables["deletions"] = ("deletions", _log_location("Odoo", deletions_table_name()))
+    return tables
 
 
-def build_base_inventory():
-    """Runs the query and returns (inventory, lot_ids).
-
-    inventory: stock rows sorted "products with images first", with helper
-        columns the filters use (computed once here instead of on every click).
-        image_1920 is the lot's ODOO image taken live from product_images, so
-        it matches the lot-coverage query even if the gallery table is older.
-    lot_ids: every product_images id of the lots in the inventory
-        (pi_id, _img_key) - used to match app uploads to lots."""
-    started = time.perf_counter()
+# ===========================================================
+# Reading the data
+# ===========================================================
+def load_inventory_rows() -> pd.DataFrame:
+    """The stock rows (no images yet) with the helper columns the filters use
+    (computed once here instead of on every click)."""
     plan = _inventory_plan_from_gold() if GALLERY_TABLE else _inventory_plan_from_odoo()
 
     # Re-apply the company exclusions: the gallery table may have been built
-    # with an older EXCLUDED_COMPANIES list.
+    # with an older EXCLUDED_COMPANIES list. Only the companies in
+    # COMPANY_LABELS are shown anywhere in the app (cards, filters, counts,
+    # Excel export) - add a company there to show it.
     plan = plan.filter(~pl.col("company").is_in(sorted(EXCLUDED_COMPANIES)))
-    # Only the companies in COMPANY_LABELS are shown anywhere in the app (cards,
-    # filters, counts, Excel export). Others in the data (e.g. "Wedtree - HSR",
-    # "Wedtree Lifestyle Private Limited - CPI") are left out - add them to
-    # COMPANY_LABELS to show them.
     plan = plan.with_columns(pl.col("company").replace(COMPANY_LABELS)).filter(
         pl.col("company").is_in(sorted(set(COMPANY_LABELS.values())))
     )
 
     lot_text = pl.col("lot_number").cast(pl.Utf8).fill_null("").str.strip_chars()
+    product_text = _id_text(pl.col("product_id")).fill_null("")
     plan = plan.with_columns(
         pl.col("stock_move_date").cast(pl.Date, strict=False),
-        pl.col("pi_ids").fill_null(""),
-        # The lot across companies (product + lot), the key the query uses to
-        # decide a lot's image. Rows without a lot number get no key.
-        pl.when(lot_text == "")
-        .then(None)
-        .otherwise(
-            pl.concat_str(
-                [_id_text(pl.col("product_id")).fill_null(""),
-                 lot_text.str.to_uppercase()],
-                separator="|",
-            )
-        )
+    ).with_columns(
+        # The lot across companies (product + lot): the key a lot's image is
+        # decided by, as in the lot-coverage query. No lot number -> no key.
+        pl.when(lot_text == "").then(None)
+        .otherwise(pl.concat_str([product_text, lot_text.str.to_uppercase()], separator="|"))
         .alias("_img_key"),
-    )
-
-    # Lot image = Odoo image from LIVE product_images (any of the lot's rows
-    # that has one), exactly as the query decides it. If product_images can't
-    # be read, fall back to the image stored in the gallery table.
-    try:
-        pi_index = load_product_images_index()
-        odoo_by_lot = (
-            pi_index.filter(pl.col("odoo_image").is_not_null())
-            .sort("pi_id")
-            .group_by("_img_key")
-            .agg(pl.col("odoo_image").first().alias("_live_image"))
-        )
-        plan = plan.join(odoo_by_lot.lazy(), on="_img_key", how="left").with_columns(
-            pl.col("_live_image").fill_null(NO_IMAGE).alias("image_1920")
-        ).drop("_live_image")
-    except Exception:
-        log.warning("Couldn't read product_images; using the images stored in the gallery table", exc_info=True)
-        pi_index = None
-        plan = plan.with_columns(pl.col("image_1920").fill_null(NO_IMAGE))
-
-    plan = plan.with_columns(
-        # One key per lot, the same way the lot-coverage query counts lots:
-        # company + product + UPPER(TRIM(lot number)). Rows without a lot
-        # number get no key, so they are never counted as lots.
-        pl.when(lot_text == "")
-        .then(None)
-        .otherwise(
-            pl.concat_str(
-                [
-                    pl.col("company").cast(pl.Utf8).fill_null(""),
-                    _id_text(pl.col("product_id")).fill_null(""),
-                    lot_text.str.to_uppercase(),
-                ],
-                separator="|",
-            )
-        )
+        # One key per lot for counting (company + product + lot number).
+        pl.when(lot_text == "").then(None)
+        .otherwise(pl.concat_str([pl.col("company").cast(pl.Utf8).fill_null(""), product_text,
+                                  lot_text.str.to_uppercase()], separator="|"))
         .alias("_lot_count_key"),
         (pl.lit(date.today()) - pl.col("stock_move_date")).dt.total_days().alias("overall_age"),
-        (pl.col("image_1920") == NO_IMAGE).alias("_no_image"),
         # Lower-cased search text, so a search is one vectorised .contains()
-        pl.concat_str(
-            [
-                pl.col("product_name").cast(pl.Utf8).fill_null("").str.to_lowercase(),
-                pl.col("sku").cast(pl.Utf8).fill_null("").str.to_lowercase(),
-            ],
-            separator="\n",
-        ).alias("_search"),
+        pl.concat_str([pl.col("product_name").cast(pl.Utf8).fill_null("").str.to_lowercase(),
+                       pl.col("sku").cast(pl.Utf8).fill_null("").str.to_lowercase()],
+                      separator="\n").alias("_search"),
         pl.col("lot_number").cast(pl.Utf8).fill_null("").str.to_lowercase().alias("_lot_lc"),
-    ).sort(
-        # Products with a real image always come first; filters keep this order.
-        # location is a final tie-breaker and maintain_order makes the sort
-        # stable, so the same data always gives the same pages.
-        ["_no_image", "company", "category", "vendor", "sku", "lot_number", "location"],
-        nulls_last=True,
-        maintain_order=True,
-    ).drop(["_no_image", "stock_move_date"])
+    ).drop(["stock_move_date", "image_1920", "pi_ids"])
 
-    df = plan.collect(engine="streaming").to_pandas()
+    rows = plan.collect(engine="streaming").to_pandas()
+    # Normalised category for the category filter - per DISTINCT category.
+    mapping = {value: normalize_category_value(value) for value in rows["category"].dropna().unique()}
+    rows["_cat_norm"] = rows["category"].map(mapping).fillna("")
+    return rows
 
-    # Normalised category for the category filter - computed per DISTINCT
-    # category (a few hundred), not per row.
-    categories = df["category"]
-    mapping = {value: normalize_category_value(value) for value in categories.dropna().unique()}
-    df["_cat_norm"] = categories.map(mapping).fillna("")
 
-    # Ids of the lots that are in the inventory (only those, to keep memory low).
-    if pi_index is not None:
-        keys = pl.Series("_img_key", df["_img_key"].dropna().unique().tolist(), dtype=pl.Utf8)
-        lot_ids = (
-            pi_index.filter(pl.col("_img_key").is_in(keys))
-            .select("pi_id", "_img_key").unique().to_pandas()
+def product_images_lots() -> pl.LazyFrame:
+    """Odoo.product_images rows, same rules as the lot-coverage query:
+      pi_id       the product_images id as text (12345, never 12345.0)
+      _raw_id     the id exactly as stored - used to address rows when writing
+      _img_key    product_id|UPPER(TRIM(name)) - the lot, across companies
+      odoo_image  the Odoo image path, or null when blank/False/None/null"""
+    lot_name = pl.col("name").cast(pl.Utf8).str.strip_chars()
+    return (
+        _scan(lakehouse_id_silver, "Odoo", "product_images", ["id", "name", "product_id", "image_1920"])
+        .filter(pl.col("id").is_not_null() & lot_name.is_not_null() & (lot_name != ""))
+        .select(
+            _id_text(pl.col("id")).alias("pi_id"),
+            pl.col("id").cast(pl.Utf8).alias("_raw_id"),
+            pl.concat_str([_id_text(pl.col("product_id")), lot_name.str.to_uppercase()],
+                          separator="|").alias("_img_key"),
+            pl.col("image_1920").cast(pl.Utf8).str.strip_chars().alias("odoo_image"),
         )
-    else:
-        lot_ids = _lot_ids_from_pi_ids(df)
-
-    log.info(
-        "inventory built from %s: %d rows, %d lot ids, images from %s, in %.1fs",
-        f"{GALLERY_TABLE_SCHEMA}.{GALLERY_TABLE}" if GALLERY_TABLE else "Odoo tables",
-        len(df), len(lot_ids), "live product_images" if pi_index is not None else "the gallery table",
-        time.perf_counter() - started,
+        .filter(pl.col("_img_key").is_not_null())
+        .with_columns(
+            pl.when(pl.col("odoo_image").is_null()
+                    | pl.col("odoo_image").str.to_lowercase().is_in(["", "false", "none", "null"]))
+            .then(None).otherwise(pl.col("odoo_image")).alias("odoo_image")
+        )
     )
-    return df, lot_ids
 
 
-# ===========================================================
-# Images uploaded in the app
-# The report shows coalesce(app image, Odoo image) PER LOT. Uploads are
-# matched on the lot's product_images id. Only this small table is re-read
-# every APP_IMAGES_TTL_SECONDS, so new uploads appear without a rebuild.
-# ===========================================================
+def load_product_images_index() -> pl.DataFrame:
+    return product_images_lots().collect()
+
+
+SORT_COLUMNS = ["_no_image", "company", "category", "vendor", "sku", "lot_number", "location"]
+
+
+def attach_odoo_images(rows: pd.DataFrame, pi_index: pl.DataFrame, deleted_ids):
+    """(base_df, lot_ids, shared_paths).
+    base_df: the rows with image_1920 = the lot's Odoo image (or NO_IMAGE),
+        products with images first. Photos deleted in the app never count.
+    lot_ids: every product_images id of the lots shown (pi_id, _raw_id,
+        _img_key, odoo_image) - matches app uploads to lots, and photo delete
+        uses it so it needn't read product_images again.
+    shared_paths: Odoo image path -> ids, for paths more than one id uses
+        (photo delete keeps those files)."""
+    if deleted_ids:
+        pi_index = pi_index.with_columns(
+            pl.when(pl.col("pi_id").is_in(sorted(deleted_ids))).then(None)
+            .otherwise(pl.col("odoo_image")).alias("odoo_image"))
+    keys = pl.Series("_img_key", rows["_img_key"].dropna().unique().tolist(), dtype=pl.Utf8)
+    lots = pi_index.filter(pl.col("_img_key").is_in(keys)).unique(subset=["pi_id"], keep="first")
+    by_lot = (lots.filter(pl.col("odoo_image").is_not_null()).sort("pi_id")
+              .group_by("_img_key").agg(pl.col("odoo_image").first()))
+    image_of = pd.Series(by_lot["odoo_image"].to_list(), index=by_lot["_img_key"].to_list(), dtype=object)
+
+    base = rows.copy()
+    base["image_1920"] = base["_img_key"].map(image_of).fillna(NO_IMAGE)
+    base["_no_image"] = base["image_1920"] == NO_IMAGE
+    base = (base.sort_values(SORT_COLUMNS, kind="stable", na_position="last")
+            .drop(columns="_no_image").reset_index(drop=True))
+
+    shared = (pi_index.filter(pl.col("odoo_image").is_not_null())
+              .group_by("odoo_image").agg(pl.col("pi_id").unique())
+              .filter(pl.col("pi_id").list.len() > 1))
+    shared_paths = {path: set(ids) for path, ids in shared.iter_rows()}
+    lot_ids = lots.select("pi_id", "_raw_id", "_img_key", "odoo_image").to_pandas()
+    return base, lot_ids, shared_paths
+
+
+def _apply_logged_deletions(base_df: pd.DataFrame, lot_ids: pd.DataFrame, deleted_ids):
+    """Removes the Odoo images of ids in the deletions log from base_df /
+    lot_ids without re-reading anything (a lot keeps an Odoo image from one of
+    its other ids if it has one)."""
+    if not deleted_ids:
+        return base_df, lot_ids
+    hit = lot_ids["pi_id"].isin(list(deleted_ids)) & lot_ids["odoo_image"].notna()
+    if not hit.any():
+        return base_df, lot_ids
+    lot_ids = lot_ids.copy()
+    lot_ids.loc[hit, "odoo_image"] = None
+    keys = set(lot_ids.loc[hit, "_img_key"])
+    remaining = (lot_ids[lot_ids["_img_key"].isin(keys) & lot_ids["odoo_image"].notna()]
+                 .sort_values("pi_id").groupby("_img_key")["odoo_image"].first())
+    mask = base_df["_img_key"].isin(keys).to_numpy()
+    base_df = base_df.copy()
+    base_df.loc[mask, "image_1920"] = base_df.loc[mask, "_img_key"].map(remaining).fillna(NO_IMAGE).to_numpy()
+    no_image = (base_df["image_1920"] == NO_IMAGE).to_numpy()
+    return base_df.iloc[no_image.argsort(kind="stable")].reset_index(drop=True), lot_ids
+
+
+# --- Images uploaded in the upload app (Odoo.product_image_overrides) -------
 EMPTY_UPLOADS = pd.DataFrame({"pi_id": pd.Series(dtype=str), "image_path": pd.Series(dtype=str),
-                              "uploaded_at": pd.Series(dtype="datetime64[ns, UTC]")})
+                              "uploaded_at": pd.Series(dtype="datetime64[us, UTC]")})
+
+
+def _clean_uploads(lf: pl.LazyFrame) -> pl.LazyFrame:
+    return (
+        lf.select(
+            _id_text(pl.col("id")).alias("pi_id"),
+            pl.col("image_path").cast(pl.Utf8).str.strip_chars().alias("image_path"),
+            pl.col("uploaded_at").cast(pl.Datetime("us", "UTC"), strict=False).alias("uploaded_at"),
+        )
+        .filter(pl.col("pi_id").is_not_null() & (pl.col("pi_id") != "")
+                & pl.col("image_path").str.starts_with("abfss://"))
+    )
+
+
+def _newest_per_lot(uploads: pd.DataFrame) -> pd.DataFrame:
+    return (uploads.sort_values("uploaded_at", kind="stable", na_position="first")
+            .drop_duplicates("pi_id", keep="last").reset_index(drop=True))
 
 
 def load_app_images() -> pd.DataFrame:
-    """Newest app upload per lot: columns pi_id (text), image_path, uploaded_at.
-    Raises if the table can't be read - the caller keeps the last good copy
-    and tries again on the next pass (a failure is never cached as "no uploads")."""
-    uploads = (
-        pl.scan_delta(
-            table_uri(lakehouse_id_silver, "Odoo", app_images_table_name()),
-            storage_options=storage_options,
-        )
-        .select(
-            _id_text(pl.col("id")).alias("pi_id"),
-            pl.col("image_path").cast(pl.Utf8).str.strip_chars().alias("image_path"),
-            pl.col("uploaded_at"),
-        )
-        .filter(
-            pl.col("pi_id").is_not_null()
-            & (pl.col("pi_id") != "")
-            & pl.col("image_path").str.starts_with("abfss://")
-        )
-        .sort("uploaded_at", nulls_last=False)
-        .unique(subset=["pi_id"], keep="last", maintain_order=True)
-        .collect()
-    )
-    return uploads.to_pandas() if uploads.height else EMPTY_UPLOADS.copy()
+    """The whole uploads table: newest upload per product_images id."""
+    uploads = _clean_uploads(pl.scan_delta(table_uri(lakehouse_id_silver, "Odoo", app_images_table_name()),
+                                           storage_options=storage_options)).collect()
+    return _newest_per_lot(uploads.to_pandas()) if uploads.height else EMPTY_UPLOADS.copy()
+
+
+def read_new_uploads(location, from_version: int, to_version: int):
+    """The rows added by commits from_version+1 .. to_version, read straight
+    from the new data files - the rest of the table isn't touched. Returns
+    None when a commit did more than add files (a delete, a compaction, a
+    schema change, too many commits): then the whole table is re-read."""
+    if to_version - from_version > INCREMENTAL_MAX_COMMITS:
+        return None
+    filesystem, log_dir = location
+    table_dir = log_dir.rsplit("/_delta_log", 1)[0]
+    client = get_datalake_service_client()
+    paths = []
+    for version in range(from_version + 1, to_version + 1):
+        raw = _file_client(client, filesystem, f"{log_dir}/{version:020d}.json").download_file().readall()
+        for line in raw.decode("utf-8").splitlines():
+            if not line.strip():
+                continue
+            action = json.loads(line)
+            if "add" in action:
+                add = action["add"]
+                if add.get("deletionVector") or add.get("partitionValues") or "://" in add["path"]:
+                    return None
+                paths.append(unquote(add["path"]))
+            elif any(key in action for key in ("remove", "metaData", "protocol", "cdc")):
+                return None
+    if not paths:
+        return EMPTY_UPLOADS.copy()
+    frames = [pl.read_parquet(BytesIO(_file_client(client, filesystem, f"{table_dir}/{p}")
+                                      .download_file().readall())) for p in paths]
+    new = _clean_uploads(pl.concat(frames, how="diagonal_relaxed").lazy()).collect()
+    return new.to_pandas() if new.height else EMPTY_UPLOADS.copy()
+
+
+def load_deleted_ids() -> set:
+    """product_images ids whose photo was deleted in the app (any computer)."""
+    ids = (pl.scan_delta(table_uri(lakehouse_id_silver, "Odoo", deletions_table_name()),
+                         storage_options=storage_options)
+           .filter(pl.col("source") == "product_images")
+           .select(_id_text(pl.col("pi_id")).alias("pi_id")).unique().collect())
+    return set(ids["pi_id"].to_list())
 
 
 def apply_app_images(df: pd.DataFrame, uploads: pd.DataFrame, lot_ids: pd.DataFrame):
-    """image_1920 = the lot's app image where it has one, else its Odoo image -
-    the same rule as the lot-coverage query: a lot (product + lot number) has an
-    app image if ANY of its product_images ids has an upload. lot_ids comes from
-    live product_images, so uploads to lot records newer than the gallery table
-    are matched too. Keeps "products with images first", so a lot that only got
-    its image in the app moves up with the others (the rest of the order is
-    unchanged). Returns (df, number of lots that got an app image)."""
+    """image_1920 = the lot's app image where it has one, else its Odoo image
+    (a lot has an app image if ANY of its product_images ids has an upload).
+    Keeps "products with images first". Returns (df, lots with an app image)."""
     if uploads is None or uploads.empty or lot_ids is None or lot_ids.empty:
         return df, 0
-    matches = (
-        uploads.merge(lot_ids, on="pi_id", how="inner")
-        .sort_values("uploaded_at", kind="stable", na_position="first")
-        .drop_duplicates("_img_key", keep="last")     # newest upload if several ids of the lot have one
-    )
-    log.info("app images: %d uploads matched to %d lots", len(uploads), len(matches))
+    matches = (uploads.merge(lot_ids[["pi_id", "_img_key"]], on="pi_id", how="inner")
+               .sort_values("uploaded_at", kind="stable", na_position="first")
+               .drop_duplicates("_img_key", keep="last"))
     if matches.empty:
         return df, 0
     paths = pd.Series(matches["image_path"].to_numpy(), index=matches["_img_key"].to_numpy())
@@ -1473,27 +1589,22 @@ def apply_app_images(df: pd.DataFrame, uploads: pd.DataFrame, lot_ids: pd.DataFr
 
 
 def compute_filter_options(df: pd.DataFrame) -> dict:
-    """Option lists for every filter dropdown, computed once per data build
-    and shared by all sessions."""
-    company_values = [
-        value for value in sorted(df["company"].dropna().unique())
-        if value not in EXCLUDED_COMPANIES
-    ]
-
+    """Option lists for every filter dropdown, computed once per rebuild and
+    shared by all sessions."""
+    company_values = [value for value in sorted(df["company"].dropna().unique())
+                      if value not in EXCLUDED_COMPANIES]
     pairs = df[["company", "location"]].dropna(subset=["location"]).drop_duplicates()
     pairs = pairs[~pairs["location"].map(location_is_excluded)]
     location_by_company = {
         company: sorted(group["location"].unique())
         for company, group in pairs.dropna(subset=["company"]).groupby("company")
     }
-
     category_values = sorted({
         value
-        for raw in df["category"].dropna().unique()          # distinct values only
+        for raw in df["category"].dropna().unique()
         for value in expand_category_hierarchy(raw)
         if not str(value).strip().upper().startswith(EXCLUDED_CATEGORY_PREFIX)
     })
-
     return {
         "company": company_values,
         "category": category_values,
@@ -1504,199 +1615,144 @@ def compute_filter_options(df: pd.DataFrame) -> dict:
 
 
 # ===========================================================
-# Shared data snapshot (stale-while-revalidate)
+# Shared data (one copy per app process, used by every session)
 # ===========================================================
 @dataclass(frozen=True, eq=False)
 class GallerySnapshot:
-    df: pd.DataFrame          # inventory with app images applied - READ-ONLY
-    base_df: pd.DataFrame     # inventory as built from Fabric - READ-ONLY
-    lot_ids: pd.DataFrame     # product_images ids of each lot (pi_id, _img_key) - READ-ONLY
+    df: pd.DataFrame          # what the cards show (app uploads applied) - READ-ONLY
+    base_df: pd.DataFrame     # same rows with Odoo images only - READ-ONLY
+    lot_ids: pd.DataFrame     # product_images ids per lot (pi_id, _raw_id, _img_key, odoo_image)
     options: dict
-    version: tuple            # source Delta versions the build was made from
+    shared_paths: dict        # Odoo image paths used by more than one id
+    uploads_info: dict
     built_at: float
-    images_at: float
-    checked_at: float
-    # App uploads status for the screen: read / matched_lots / error / checked_at
-    uploads_info: dict = field(default_factory=dict)
+    generation: int           # +1 whenever what the cards show changes
 
 
 class _DataStore:
     def __init__(self):
-        self.lock = threading.Lock()
+        self.lock = threading.Lock()       # guards swapping the snapshot
         self.snapshot = None
-        # App-uploaded images are read on their own thread so a slow read of
-        # that table never holds up the gallery (see refresh_data).
-        self.uploads_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="app-images")
-        self.uploads_job = None          # Future of the read in progress
-        self.uploads_df = None           # last uploads table that was read
-        self.uploads_version = None      # its Delta version
-        self.uploads_error = None        # last read error (text), None once a read works
+        self.uploads_df = None             # newest upload per product_images id
+        self.deleted_ids = None            # ids whose photo was deleted in the app
+        self.versions = {}                 # table -> commit version last read
+        self.last_error = None             # last refresh error (text), None once a refresh works
+        # Photo deletes are saved to Fabric by one background worker, one at a time.
+        self.delete_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="photo-delete")
+        self.hidden = {}                   # img_key -> {"pi_ids", "until"}: photos deleted, not shown
+        self.pending_deletes = 0
+        self.delete_notes = []             # (session id, message) for deletes that went wrong
+        self.force_token = 0               # bumped when the tables must be re-read
+        self.forced_done = 0
 
 
 @st.cache_resource(show_spinner=False)
 def data_store() -> _DataStore:
-    # One store per app process, shared by every session and the background
-    # thread (module globals don't work: Streamlit re-executes this file on
-    # every rerun).
     return _DataStore()
 
 
-def _timed(timings: dict, name: str, fn, *args):
-    """Runs fn(*args) and records how long it took (shown in the refresh log)."""
-    started = time.perf_counter()
-    try:
-        return fn(*args)
-    finally:
-        timings[name] = time.perf_counter() - started
-
-
-def _read_uploads(store: _DataStore):
-    """(uploads DataFrame, version, changed). Skips the read when the table's
-    Delta version is the same as last time."""
-    started = time.perf_counter()
-    try:
-        version = delta_version(table_uri(lakehouse_id_silver, "Odoo", app_images_table_name()))
-    except Exception:
-        version = None
-    if version is not None and version == store.uploads_version and store.uploads_df is not None:
-        return store.uploads_df, version, False
-    uploads = load_app_images()
-    log.info("app image table read: %d uploads in %.1fs", len(uploads), time.perf_counter() - started)
-    return uploads, version, True
-
-
-def _start_uploads_read(store: _DataStore):
-    if store.uploads_job is None:
-        store.uploads_job = store.uploads_pool.submit(_read_uploads, store)
-
-
-def _take_uploads(store: _DataStore, wait: float = 0):
-    """The finished uploads read as (DataFrame, changed), or None if it is
-    still running (waits up to `wait` seconds for it)."""
-    job = store.uploads_job
-    if job is None:
-        return None
-    try:
-        uploads, version, changed = job.result(timeout=wait)
-    except FutureTimeout:
-        return None
-    except Exception as exc:
-        # Keep the last good uploads (None on a cold start, so the next pass
-        # simply tries again) - a failed read is never taken as "no uploads".
-        log.warning("App image table read failed; will retry", exc_info=True)
-        store.uploads_error = f"{type(exc).__name__}: {str(exc).splitlines()[0][:200] if str(exc) else ''}"
-        store.uploads_job = None
-        if store.uploads_df is None:
-            return None
-        return store.uploads_df, False
-    store.uploads_error = None
-    store.uploads_job = None
-    if uploads is None:
-        return None
-    store.uploads_df, store.uploads_version = uploads, version
-    return uploads, changed
-
-
-def refresh_data() -> GallerySnapshot:
-    """Brings the shared snapshot up to date and returns it. Only one thread
-    rebuilds at a time; readers keep using the previous snapshot meanwhile."""
-    store = data_store()
+def _publish(store: _DataStore, base_df, lot_ids, shared_paths, uploads, options=None, built_at=None):
     with store.lock:
-        snap = store.snapshot
         now = time.time()
-
-        inventory_due = snap is None or now - snap.built_at >= DATA_TTL_SECONDS
-        version = snap.version if snap is not None else None
-        checked_at = snap.checked_at if snap is not None else 0.0
-
-        if not inventory_due and now - checked_at >= VERSION_CHECK_SECONDS:
-            checked_at = now
-            latest = source_version()
-            if latest is not None and latest != snap.version:
-                log.info("source tables changed %s -> %s; rebuilding", snap.version, latest)
-                inventory_due = True
-
-        # App uploads: re-read every APP_IMAGES_TTL_SECONDS in the background;
-        # a finished read is applied on the next pass (at most a minute later).
-        if snap is None or now - snap.images_at >= APP_IMAGES_TTL_SECONDS:
-            _start_uploads_read(store)
-        taken = _take_uploads(store)
-
-        if not inventory_due and taken is None:
-            info = {**snap.uploads_info, "error": store.uploads_error}
-            if snap.checked_at != checked_at or info != snap.uploads_info:
-                store.snapshot = replace(snap, checked_at=checked_at, uploads_info=info)
-            return store.snapshot
-        if not inventory_due and not taken[1]:
-            # Uploads table unchanged: nothing to re-apply.
-            info = {**snap.uploads_info, "checked_at": now, "error": store.uploads_error}
-            store.snapshot = replace(snap, images_at=now, checked_at=checked_at, uploads_info=info)
-            return store.snapshot
-
-        base_df = lot_ids = options = None
-        built_at = now
-        timings = {}
-        started = time.perf_counter()
-        if inventory_due:
-            # The version read runs alongside the build and starts with it, so
-            # if the ETL writes during the build the next check sees a newer
-            # version and rebuilds again.
-            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="gallery-version") as ex:
-                version_job = ex.submit(_timed, timings, "version check", source_version)
-                try:
-                    new_df, new_lot_ids = _timed(timings, "inventory", build_base_inventory)
-                    new_options = _timed(timings, "filter options", compute_filter_options, new_df)
-                    base_df, lot_ids, options = new_df, new_lot_ids, new_options
-                    version = version_job.result() or ()
-                    checked_at = now
-                except Exception:
-                    if snap is None:
-                        raise
-                    log.warning("Inventory refresh failed; still serving the previous data", exc_info=True)
-            if taken is None and store.uploads_df is None:
-                # First load: give the uploads table a few more seconds, but
-                # never let it hold up the gallery.
-                taken = _timed(timings, "waiting for app image table", _take_uploads,
-                               store, APP_IMAGES_WAIT_SECONDS)
-        if base_df is None:
-            base_df, lot_ids, options, built_at = snap.base_df, snap.lot_ids, snap.options, snap.built_at
-
-        if taken is not None:
-            uploads, images_at = taken[0], now
-        else:
-            uploads = store.uploads_df          # last known uploads (None on a cold start)
-            images_at = snap.images_at if snap is not None else 0.0
-            if uploads is None:
-                log.warning(
-                    "App image table is still loading; showing Odoo images until it is ready. "
-                    "If this keeps happening, compact the table (see build_product_gallery_table.py)."
-                )
-        if uploads is not None:
-            df, matched_lots = _timed(timings, "apply app images", apply_app_images, base_df, uploads, lot_ids)
-        else:
-            df, matched_lots = base_df, None
-        uploads_info = {
-            "read": None if uploads is None else len(uploads),
-            "matched_lots": matched_lots,
-            "error": store.uploads_error,
-            "checked_at": images_at or None,
-        }
-        log.info(
-            "data refresh done in %.1fs (%s)", time.perf_counter() - started,
-            ", ".join(f"{name} {secs:.1f}s" for name, secs in timings.items()),
-        )
+        for key in [k for k, v in store.hidden.items() if v["until"] is not None and v["until"] <= now]:
+            del store.hidden[key]
+        hidden = {k: set(v["pi_ids"]) for k, v in store.hidden.items()}
+    hidden_ids = set().union(*hidden.values()) if hidden else set()
+    visible_uploads = uploads[~uploads["pi_id"].isin(hidden_ids)] if hidden_ids else uploads
+    df, matched = apply_app_images(base_df, visible_uploads, lot_ids)
+    if hidden:     # deletes still being saved: never shown again, whatever a table still says
+        df = _without_lot_images(df, set(hidden))
+    with store.lock:
+        old = store.snapshot
         store.snapshot = GallerySnapshot(
-            df=df, base_df=base_df, lot_ids=lot_ids, options=options, version=version,
-            built_at=built_at, images_at=images_at, checked_at=checked_at,
-            uploads_info=uploads_info,
+            df=df, base_df=base_df, lot_ids=lot_ids,
+            options=options if options is not None else old.options,
+            shared_paths=shared_paths,
+            uploads_info={"read": len(uploads), "matched_lots": matched},
+            built_at=built_at if built_at is not None else old.built_at,
+            generation=(old.generation + 1) if old is not None else 1,
         )
-        return store.snapshot
 
 
-def get_snapshot() -> GallerySnapshot:
-    """Instant once anything is loaded; refreshes happen in the background."""
-    snap = data_store().snapshot
-    return snap if snap is not None else refresh_data()
+def refresh_if_changed(store: _DataStore):
+    """One pass of the background thread: look for changes, re-read only what
+    changed, publish a new snapshot. Raises on failure - the versions are then
+    not moved on, so the next pass tries again."""
+    tables = watched_tables()
+    seen = store.versions
+    latest = {name: latest_version(location, seen.get(name)) for name, (_, location) in tables.items()}
+    changed = {name for name in tables if latest[name] != seen.get(name)}
+    kinds = {tables[name][0] for name in changed}
+    force_token = store.force_token
+    forced = force_token != store.forced_done          # a delete failed: re-read the tables it touches
+    if forced:
+        changed |= {"product_images", "uploads", "deletions"}
+        kinds |= {"images", "uploads", "deletions"}
+
+    snap = store.snapshot
+    full = (snap is None or "inventory" in kinds
+            or time.time() - snap.built_at >= FULL_REBUILD_SECONDS)
+    if not full and not kinds:
+        return
+    started = time.perf_counter()
+    steps = []
+
+    def step(name, fn, *args):
+        t = time.perf_counter()
+        value = fn(*args)
+        steps.append(f"{name} {time.perf_counter() - t:.1f}s")
+        return value
+
+    log.info("refresh: %s (changed: %s)", "full rebuild" if full else ", ".join(sorted(kinds)),
+             ", ".join(f"{n} v{seen.get(n)}->v{latest[n]}" for n in sorted(changed)) or "first load / daily")
+
+    deleted = store.deleted_ids
+    if full or "deletions" in kinds or deleted is None:
+        deleted = step("deletions log", load_deleted_ids) if latest["deletions"] is not None else set()
+
+    uploads = store.uploads_df
+    if full or "uploads" in kinds or uploads is None:
+        new = None
+        if (not full and not forced and uploads is not None and seen.get("uploads") is not None
+                and latest["uploads"] is not None):
+            try:
+                new = step("new uploads", read_new_uploads, tables["uploads"][1],
+                           seen["uploads"], latest["uploads"])
+            except Exception as exc:
+                log.warning("reading only the new uploads failed (%s: %s); reading the whole table",
+                            type(exc).__name__, exc)
+        if new is not None:
+            uploads = _newest_per_lot(pd.concat([uploads, new], ignore_index=True)) if len(new) else uploads
+            steps.append(f"+{len(new)} upload rows")
+        elif latest["uploads"] is not None:
+            uploads = step("uploads table", load_app_images)
+        else:
+            uploads = EMPTY_UPLOADS.copy()
+
+    options = built_at = None
+    if full:
+        rows = step("inventory", load_inventory_rows)
+        pi_index = step("product_images", load_product_images_index)
+        base_df, lot_ids, shared = step("lot images", attach_odoo_images, rows, pi_index, deleted)
+        options = step("filter options", compute_filter_options, base_df)
+        built_at = time.time()
+    elif "images" in kinds:
+        pi_index = step("product_images", load_product_images_index)
+        base_df, lot_ids, shared = step("lot images", attach_odoo_images,
+                                        snap.base_df.drop(columns="image_1920"), pi_index, deleted)
+    else:
+        base_df, lot_ids, shared = snap.base_df, snap.lot_ids, snap.shared_paths
+        if "deletions" in kinds:
+            base_df, lot_ids = _apply_logged_deletions(base_df, lot_ids, deleted)
+
+    store.uploads_df, store.deleted_ids = uploads, deleted
+    step("publish", _publish, store, base_df, lot_ids, shared, uploads, options, built_at)
+    store.versions = latest
+    store.forced_done = force_token
+    snap = store.snapshot
+    log.info("refresh done in %.1fs (%s) - %d cards, %d with an app image, generation %d, memory %s",
+             time.perf_counter() - started, ", ".join(steps), len(snap.df),
+             snap.uploads_info["matched_lots"], snap.generation, _memory_text())
 
 
 # The background thread uses Streamlit's caches outside a page run, which makes
@@ -1707,29 +1763,47 @@ logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").set
 @st.cache_resource
 def start_background_refresh() -> bool:
     """One refresh thread per app process, started on the first visit (the
-    login page), so data loads while people sign in and later rebuilds never
-    block a user."""
-    if GALLERY_TABLE:
-        log.info("data source: pre-joined table %s.%s", GALLERY_TABLE_SCHEMA, GALLERY_TABLE)
-    else:
-        log.warning(
-            "data source: GALLERY_TABLE is not set in secrets, so the app joins the five "
-            "Odoo tables itself (slow). Add GALLERY_TABLE = \"product_gallery_inventory\"."
-        )
+    login page), so data loads while people sign in."""
+    store = data_store()
+    log.info("data source: %s", f"{GALLERY_TABLE_SCHEMA}.{GALLERY_TABLE}" if GALLERY_TABLE
+             else "the Odoo tables (set GALLERY_TABLE in secrets for a faster start)")
 
     def loop():
+        failures, last_heartbeat, prefetched = 0, time.time(), None
         while True:
             try:
-                snap = refresh_data()
-                refs = snap.df["image_1920"].iloc[:PAGE_SIZE * WARMUP_PREFETCH_PAGES].tolist()
-                if refs:
-                    get_card_images(refs)            # waits until loaded
-            except Exception:
-                log.warning("Background refresh failed; will retry", exc_info=True)
-            time.sleep(REFRESH_CHECK_SECONDS)
+                refresh_if_changed(store)
+                failures, store.last_error = 0, None
+            except Exception as exc:
+                failures += 1
+                store.last_error = f"{type(exc).__name__}: {str(exc).splitlines()[0][:300] if str(exc) else ''}"
+                log.exception("refresh failed (attempt %d) - will try again", failures)
+            snap = store.snapshot
+            if snap is not None and snap.generation != prefetched:
+                prefetched = snap.generation          # warm the first pages' thumbnails
+                prefetch_images(snap.df["image_1920"].iloc[:PAGE_SIZE * WARMUP_PREFETCH_PAGES].tolist())
+            if time.time() - last_heartbeat >= HEARTBEAT_SECONDS:
+                last_heartbeat = time.time()
+                log.info("heartbeat: running, memory %s, %s cards, generation %s, threads %d",
+                         _memory_text(), len(snap.df) if snap is not None else "-",
+                         snap.generation if snap is not None else "-", threading.active_count())
+            time.sleep(CHANGE_CHECK_SECONDS if not failures else min(60, CHANGE_CHECK_SECONDS * 2 ** failures))
 
     threading.Thread(target=loop, name="gallery-refresh", daemon=True).start()
     return True
+
+
+def wait_for_first_snapshot() -> GallerySnapshot:
+    """Only after an app (re)start: wait for the background thread's first load."""
+    store = data_store()
+    deadline = time.time() + FIRST_LOAD_TIMEOUT_SECONDS
+    while store.snapshot is None:
+        if store.last_error:
+            raise RuntimeError(store.last_error)
+        if time.time() > deadline:
+            raise TimeoutError("the first data load is taking too long - see the terminal log")
+        time.sleep(0.5)
+    return store.snapshot
 
 
 # ===========================================================
@@ -1973,6 +2047,361 @@ def reset_page_if_filters_changed(filters: dict):
     if st.session_state.get("_filter_key") != key:
         st.session_state._filter_key = key
         st.session_state.page = 1
+
+
+# ===========================================================
+# Deleting a lot's photo (anyone signed in - the gallery login is the admin login)
+#
+# For the clicked card's lot - product + lot number, across companies, the
+# same lot the card's image is decided for:
+#   product_image_overrides  every app-upload row of the lot's product_images
+#                            ids is DELETED, and its image file removed
+#   product_images           image_1920 is set to NULL on the lot's rows that
+#                            have a path - the records themselves are KEPT -
+#                            and the image file removed
+#   product_image_deletions  one row per change: who, when, what (audit log;
+#                            other computers pick deletes up from it, and the
+#                            Source->Bronze notebook reads it so the nightly
+#                            load doesn't bring the Odoo image back)
+# A file is only removed when no other record still points to it. Saved
+# thumbnails of the removed files are deleted too. One confirmation, then the
+# photo disappears at once and Fabric is updated in the background
+# (see start_photo_delete).
+# ===========================================================
+def deletions_table_name() -> str:
+    """Optional secret PRODUCT_IMAGE_DELETIONS_TABLE (Odoo schema of the silver
+    lakehouse); defaults to product_image_deletions."""
+    return _safe_identifier(secret("PRODUCT_IMAGE_DELETIONS_TABLE"), "product_image_deletions")
+
+
+DELETIONS_SCHEMA = {
+    "deleted_at": pl.Datetime("us", "UTC"),
+    "deleted_by": pl.Utf8,
+    "company": pl.Utf8,
+    "product_id": pl.Utf8,
+    "sku": pl.Utf8,
+    "lot_number": pl.Utf8,
+    "pi_id": pl.Utf8,             # product_images id, plain text (e.g. 12345)
+    "source": pl.Utf8,            # "product_images" or the overrides table name
+    "action": pl.Utf8,            # "image_1920 cleared" / "record deleted"
+    "image_path": pl.Utf8,
+}
+
+
+def _id_predicate(id_dtype, rows: pl.DataFrame) -> str:
+    """`id IN (...)` for rows (pi_id, _raw_id), written to match the column's
+    own type: numbers for a numeric id column, the stored text otherwise."""
+    if id_dtype.is_numeric():
+        values = sorted({v for v in rows["pi_id"].to_list() if v and v.isdigit()})
+    else:
+        values = sorted({"'" + v.replace("'", "''") + "'" for v in rows["_raw_id"].to_list() if v is not None})
+    if not values:
+        raise ValueError("no usable ids to address the rows")
+    return f"id IN ({', '.join(values)})"
+
+
+def _deletable_path(path) -> bool:
+    """Only image files inside a lakehouse Files folder on OneLake."""
+    if not _is_image_ref(path):
+        return False
+    parsed = urlparse(path)
+    return ((parsed.hostname or "").endswith("onelake.dfs.fabric.microsoft.com")
+            and "/Files/" in parsed.path and f"/Files/{THUMB_DIR}/" not in parsed.path)
+
+
+def _still_used_paths(paths, lot_pi_ids, shared_paths: dict, uploads: pd.DataFrame) -> set:
+    """Paths another record (outside this lot) still points to - from memory."""
+    mine = set(lot_pi_ids)
+    used = {p for p in paths if shared_paths.get(p, set()) - mine}
+    if uploads is not None and len(uploads):
+        others = uploads.loc[~uploads["pi_id"].isin(mine), "image_path"]
+        used |= set(others[others.isin(list(paths))])
+    return used
+
+
+def _remove_image_file(path: str) -> bool:
+    """Deletes the file and its saved thumbnail and forgets the cached card
+    image. False if the file was already gone."""
+    client = get_datalake_service_client()
+    existed = True
+    try:
+        _file_client(client, *_parse_abfss_path(path)).delete_file()
+    except ResourceNotFoundError:
+        existed = False
+    location = _thumbnail_location(path)
+    if location:
+        try:
+            _file_client(client, *location).delete_file()
+        except ResourceNotFoundError:
+            pass
+        except Exception as exc:
+            log.info("thumbnail delete failed: %s", type(exc).__name__)
+    store = image_store()
+    with store.lock:
+        store.cache.pop(path, None)
+    return existed
+
+
+def _without_lot_images(frame: pd.DataFrame, img_keys) -> pd.DataFrame:
+    """The cards of these lots shown without a photo (images-first order kept)."""
+    hit = frame["_img_key"].isin(list(img_keys)).to_numpy()
+    if not hit.any():
+        return frame
+    frame = frame.copy()
+    frame.loc[hit, "image_1920"] = NO_IMAGE
+    no_image = (frame["image_1920"] == NO_IMAGE).to_numpy()
+    return frame.iloc[no_image.argsort(kind="stable")].reset_index(drop=True)
+
+
+def _session_id() -> str:
+    return st.session_state.setdefault("_sid", uuid.uuid4().hex)
+
+
+def start_photo_delete(item: dict, session_id: str) -> list:
+    """Checks the lot (from memory), hides its photo at once for everyone
+    using the app, and queues the actual delete - saved to Fabric in the
+    background, one delete at a time. Returns error messages (empty = done)."""
+    store = data_store()
+    snap = store.snapshot
+    img_key = item.get("_img_key")
+    if not isinstance(img_key, str) or not img_key or snap is None:
+        return ["This card has no lot number, so there is no photo record to delete."]
+    with store.lock:
+        if img_key in store.hidden:
+            return ["This photo is already being deleted."]
+    lot = snap.lot_ids[snap.lot_ids["_img_key"] == img_key]
+    if lot.empty:
+        return ["No product_images record found for this lot."]
+    pi_ids = sorted(set(lot["pi_id"].astype(str)))
+    odoo = [(str(i), p) for i, p in zip(lot["pi_id"], lot["odoo_image"]) if isinstance(p, str)]
+    uploads = store.uploads_df if store.uploads_df is not None else EMPTY_UPLOADS
+    lot_uploads = uploads[uploads["pi_id"].isin(pi_ids)]
+    if not odoo and lot_uploads.empty:
+        return ["This lot has no photo any more."]
+
+    plan = {
+        "img_key": img_key, "pi_ids": pi_ids,
+        "id_rows": list(zip(lot["pi_id"].astype(str), lot["_raw_id"].astype(str))), "odoo": odoo,
+        "uploads": list(zip(lot_uploads["pi_id"].astype(str), lot_uploads["image_path"])),
+        "shared_paths": snap.shared_paths or {},
+        "log_base": {"deleted_by": APP_USERNAME or "admin", "company": item.get("company"),
+                     "product_id": _id_text_value(item.get("product_id")), "sku": _text_or_none(item.get("sku")),
+                     "lot_number": _text_or_none(item.get("lot_number"))},
+    }
+    with store.lock:
+        store.hidden[img_key] = {"pi_ids": set(pi_ids), "until": None}
+        store.pending_deletes += 1
+        snap = store.snapshot
+        store.snapshot = replace(snap, df=_without_lot_images(snap.df, {img_key}), generation=snap.generation + 1)
+    log.info("photo delete %s: queued - %d product_images ids, %d with an Odoo image, %d upload(s)",
+             img_key, len(pi_ids), len(odoo), len(plan["uploads"]))
+    store.delete_pool.submit(_run_photo_delete, plan, session_id)
+    return []
+
+
+def _run_photo_delete(plan: dict, session_id: str):
+    """Background worker: saves one delete to Fabric. If a table couldn't be
+    changed, the photo is shown again (its data is re-read) and the user who
+    deleted it gets an error message."""
+    store = data_store()
+    img_key = plan["img_key"]
+    result = {"errors": [], "table_failed": False}
+    try:
+        result = _save_photo_delete(plan)
+    except BaseException as exc:          # never let the worker die silently
+        log.exception("photo delete %s: unexpected error", img_key)
+        result = {"errors": [f"{type(exc).__name__}: {exc}"], "table_failed": True}
+    finally:
+        with store.lock:
+            store.pending_deletes -= 1
+            if result.get("table_failed"):
+                store.hidden.pop(img_key, None)
+                store.force_token += 1        # re-read the tables: show what is really there
+            else:
+                store.hidden[img_key] = {"pi_ids": set(plan["pi_ids"]), "until": time.time() + HIDE_GRACE_SECONDS}
+                if result.get("cleared_ids"):
+                    store.deleted_ids = set(store.deleted_ids or ()) | set(result["cleared_ids"])
+            if result.get("errors"):
+                lot = plan["log_base"].get("lot_number") or img_key
+                store.delete_notes.append((session_id, f"Photo delete for lot {lot}: " + " ".join(result["errors"])))
+            if store.snapshot is not None:       # redraw open pages (the "saving" note goes away)
+                store.snapshot = replace(store.snapshot, generation=store.snapshot.generation + 1)
+
+
+def _save_photo_delete(plan: dict) -> dict:
+    """Deletes the lot's upload records and clears its Odoo image path
+    (records kept), logs the delete and removes the files. Each step is
+    logged with its time."""
+    from deltalake import DeltaTable
+
+    img_key = plan["img_key"]
+    started = time.perf_counter()
+    steps = []
+    result = {"overrides": 0, "odoo_cleared": 0, "files_deleted": 0, "files_kept": 0, "logged": False,
+              "errors": [], "table_failed": False, "cleared_ids": []}
+    lot_rows = pl.DataFrame(plan["id_rows"], schema=["pi_id", "_raw_id"], orient="row")
+
+    def timed(name, fn):
+        t = time.perf_counter()
+        log.info("photo delete %s: %s ...", img_key, name)
+        value = fn()
+        steps.append(f"{name} {time.perf_counter() - t:.1f}s")
+        return value
+
+    ov_table = app_images_table_name()
+    log_base = {**plan["log_base"], "deleted_at": datetime.now(timezone.utc)}
+    log_rows, removed_paths = [], set()
+
+    # 1. App uploads: delete the records (all rows of the lot's ids).
+    if plan["uploads"]:
+        try:
+            dt = timed("open uploads table", lambda: DeltaTable(
+                table_uri(lakehouse_id_silver, "Odoo", ov_table), storage_options=storage_options))
+            predicate = _id_predicate(pl.scan_delta(dt).collect_schema()["id"], lot_rows)
+            timed("delete upload records", lambda: dt.delete(predicate))
+            result["overrides"] = len(plan["uploads"])
+            for pi_id, path in plan["uploads"]:
+                log_rows.append({**log_base, "pi_id": pi_id, "source": ov_table,
+                                 "action": "record deleted", "image_path": path})
+                removed_paths.add(path)
+        except Exception as exc:
+            log.exception("photo delete %s: deleting upload records failed", img_key)
+            result["errors"].append(f"Couldn't delete from {ov_table}: {type(exc).__name__}: {exc}")
+            result["table_failed"] = True
+
+    # 2. Odoo image: clear the path on every row of the lot that has one (records kept).
+    if plan["odoo"]:
+        try:
+            dt = timed("open product_images", lambda: DeltaTable(
+                table_uri(lakehouse_id_silver, "Odoo", "product_images"), storage_options=storage_options))
+            predicate = (f"{_id_predicate(pl.scan_delta(dt).collect_schema()['id'], lot_rows)} "
+                         "AND image_1920 IS NOT NULL")
+            timed("clear image_1920", lambda: dt.update(updates={"image_1920": "NULL"}, predicate=predicate))
+            result["odoo_cleared"] = len(plan["odoo"])
+            for pi_id, path in plan["odoo"]:
+                log_rows.append({**log_base, "pi_id": pi_id, "source": "product_images",
+                                 "action": "image_1920 cleared", "image_path": path})
+                removed_paths.add(path)
+                result["cleared_ids"].append(pi_id)
+        except Exception as exc:
+            log.exception("photo delete %s: clearing product_images.image_1920 failed", img_key)
+            result["errors"].append(f"Couldn't clear the Odoo image: {type(exc).__name__}: {exc}")
+            result["table_failed"] = True
+
+    # 3. Deletions log: other computers pick the delete up from it, and the
+    #    Source->Bronze notebook reads it so the nightly load doesn't bring the
+    #    Odoo image back.
+    if log_rows:
+        try:
+            timed("write deletions log", lambda: pl.DataFrame(log_rows, schema=DELETIONS_SCHEMA).write_delta(
+                table_uri(lakehouse_id_silver, "Odoo", deletions_table_name()),
+                mode="append", storage_options=storage_options))
+            result["logged"] = True
+        except Exception as exc:
+            log.exception("photo delete %s: writing the deletions log failed", img_key)
+            result["errors"].append(f"The photo was removed, but the deletions log couldn't be written "
+                                    f"({type(exc).__name__}) - the nightly load may bring the Odoo image back.")
+
+    # 4. Image files - only those no other record still uses.
+    still_used = _still_used_paths(removed_paths, plan["pi_ids"], plan["shared_paths"], data_store().uploads_df)
+    for path in sorted(removed_paths):
+        if path in still_used or not _deletable_path(path):
+            result["files_kept"] += 1
+            continue
+        try:
+            timed(f"delete file {path.rsplit('/', 1)[-1]}", lambda: _remove_image_file(path))
+            result["files_deleted"] += 1
+        except Exception as exc:
+            log.exception("photo delete %s: deleting %s failed", img_key, path)
+            result["errors"].append(f"Couldn't delete an image file ({type(exc).__name__}).")
+
+    log.info("photo delete %s saved in %.1fs (%s): %s", img_key, time.perf_counter() - started, ", ".join(steps),
+             {k: v for k, v in result.items() if k not in ("cleared_ids",)})
+    return result
+
+
+def _text_or_none(value):
+    if value is None or (not isinstance(value, str) and pd.isna(value)):
+        return None
+    return str(value)
+
+
+def _id_text_value(value):
+    text = _text_or_none(value)
+    return re.sub(r"\.0+$", "", text.strip()) if text else None
+
+
+def _clear_delete_state():
+    st.session_state.pop("_delete", None)
+
+
+def _set_delete_step(step):
+    if "_delete" in st.session_state:
+        st.session_state["_delete"]["step"] = step
+
+
+# Newer Streamlit tells the app when the dialog is closed with X / Esc. Then an
+# open delete can safely be re-shown after any rerun; older versions open it
+# on the button click only.
+DIALOG_REOPENS = "on_dismiss" in inspect.signature(st.dialog).parameters
+
+
+@st.dialog("Delete photo", **({"on_dismiss": _clear_delete_state} if DIALOG_REOPENS else {}))
+def delete_photo_dialog(item: dict):
+    """One confirmation, then the photo disappears at once and the pop-up
+    closes; Fabric is updated in the background (see start_photo_delete). The
+    buttons only change the step (callbacks), so this works the same in a full
+    page run and in a dialog rerun."""
+    state = st.session_state.get("_delete")
+    if not state:                      # Cancel / Close was clicked
+        st.rerun()
+
+    ref = item.get("image_1920")
+    thumb = None
+    if state["step"] == 1 and _is_image_ref(ref):
+        images, _ = get_card_images([ref], timeout=2)
+        thumb = images.get(ref)
+    img_col, info_col = st.columns([1, 1.5])
+    with img_col:
+        if thumb:
+            st.markdown(f'<img src="{thumb}" style="width:100%;border-radius:10px;" alt="" />',
+                        unsafe_allow_html=True)
+    with info_col:
+        st.markdown(
+            f"<div style='font-size:14px;line-height:1.7'><b>{_fmt(item.get('product_name'))}</b><br>"
+            f"SKU: {_fmt(item.get('sku'))}<br>Lot No.: {_fmt(item.get('lot_number'))}<br>"
+            f"Company: {_fmt(item.get('company'))}<br>Location: {_fmt(item.get('location'))}</div>",
+            unsafe_allow_html=True,
+        )
+
+    if state["step"] == 1:
+        st.warning(
+            "**Delete this lot's photo?** It is removed permanently, in every company: "
+            "the uploaded photo (record and file) and the Odoo image (path and file). "
+            "The product_images record itself is kept. This can't be undone."
+        )
+        c1, c2 = st.columns(2)
+        c1.button("🗑 Yes, delete", key="delete_confirm", width="stretch",
+                  on_click=_set_delete_step, args=("run",))
+        c2.button("Cancel", key="delete_cancel", width="stretch", on_click=_clear_delete_state)
+        return
+    if state["step"] == "run":
+        try:
+            errors = start_photo_delete(item, _session_id())
+        except Exception as exc:
+            log.exception("photo delete failed to start")
+            errors = [f"{type(exc).__name__}: {exc}"]
+        if not errors:
+            # Gone from every card already; Fabric is updated in the background.
+            st.session_state.pop("_delete", None)
+            st.session_state["_notice"] = "🗑 Photo deleted"
+            st.rerun()
+        state["step"] = 3
+        state["errors"] = errors
+
+    for error in state.get("errors", []):
+        st.error(error)
+    st.button("Close", key="delete_close", width="stretch", on_click=_clear_delete_state)
 
 
 # ===========================================================
@@ -2333,12 +2762,27 @@ def render_summary_bar(df: pd.DataFrame, in_stock_only: bool = False):
     if error:
         st.error(f"Excel export failed: {error}")
 
+    notice = st.session_state.pop("_notice", None)
+    if notice:
+        st.toast(notice)
+    store = data_store()
+    sid = _session_id()
+    with store.lock:
+        pending = store.pending_deletes
+        mine = [message for owner, message in store.delete_notes if owner == sid]
+        store.delete_notes = [(owner, message) for owner, message in store.delete_notes if owner != sid]
+    if pending:
+        st.caption(f"Saving {pending} photo delete{'s' if pending != 1 else ''} to Fabric in the background…")
+    for message in mine:
+        st.error(message)
+
 
 @st.fragment
 def render_results(df: pd.DataFrame, cols_per_row: int, uploads_info: dict = None,
                    in_stock_only: bool = False):
     """Product grid + pager. A fragment: Previous/Next re-run only this part,
-    not the filters, data lookup and the rest of the page."""
+    not the filters, data lookup and the rest of the page. Each card with a
+    photo gets a delete button (see delete_photo_dialog)."""
     total = len(df)
     total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
     page = min(max(1, st.session_state.get("page", 1)), total_pages)
@@ -2365,19 +2809,23 @@ def render_results(df: pd.DataFrame, cols_per_row: int, uploads_info: dict = Non
         )
     status = st.empty()
 
+    delete_item = None
     if total == 0:
         st.info("No products match the current filters.")
     else:
         for row_start in range(0, len(page_df), cols_per_row):
             row_items = page_df.iloc[row_start:row_start + cols_per_row]
             cols = st.columns(cols_per_row)
-            for col, (_, item) in zip(cols, row_items.iterrows()):
+            for col, (idx, item) in zip(cols, row_items.iterrows()):
                 with col:
                     img = image_lookup.get(item["image_1920"])
                     if DEBUG:
                         st.caption(str(item["image_1920"]))
                     loading = item["image_1920"] in pending
                     st.markdown(render_card_html(item, img, loading), unsafe_allow_html=True)
+                    if item["image_1920"] != NO_IMAGE and isinstance(item.get("_img_key"), str):
+                        if st.button("🗑 Delete photo", key=f"del_{idx}", width="stretch"):
+                            delete_item = item.to_dict()
 
     st.divider()
     c1, c2, c3 = st.columns([1, 2, 1])
@@ -2396,6 +2844,13 @@ def render_results(df: pd.DataFrame, cols_per_row: int, uploads_info: dict = Non
 
     # Load the next page's images in the background so "Next" is instant.
     prefetch_images(df["image_1920"].iloc[end:end + PAGE_SIZE].tolist())
+
+    if delete_item is not None:
+        st.session_state["_delete"] = {"step": 1, "item": delete_item}
+    open_delete = st.session_state.get("_delete")
+    if open_delete and open_delete.get("item") and (delete_item is not None or DIALOG_REOPENS):
+        delete_photo_dialog(open_delete["item"])
+        return      # no grid rerun for slow images while the dialog is open
 
     if pending:
         _show_images_as_they_arrive(status, pending)
@@ -2424,6 +2879,29 @@ def _show_images_as_they_arrive(status, pending: dict):
 
 
 # ===========================================================
+# Live updates for open pages
+# Streamlit only redraws a page when its user does something. This small
+# fragment re-runs every LIVE_UPDATE_SECONDS and redraws the page when the
+# shared data changed (an upload or a delete, from any screen or computer) -
+# but never while a delete pop-up is open.
+# ===========================================================
+FRAGMENT_RUN_EVERY = "run_every" in inspect.signature(st.fragment).parameters
+
+
+def _redraw_if_data_changed():
+    snap = data_store().snapshot
+    seen = st.session_state.get("_seen_generation")
+    if snap is None or seen is None or snap.generation == seen:
+        return
+    if st.session_state.get("_delete"):
+        return
+    st.rerun()
+
+
+live_updates = st.fragment(run_every=LIVE_UPDATE_SECONDS)(_redraw_if_data_changed) if FRAGMENT_RUN_EVERY else None
+
+
+# ===========================================================
 # Main
 # ===========================================================
 def main():
@@ -2449,15 +2927,16 @@ def main():
     try:
         snap = data_store().snapshot
         if snap is None:
-            # Only after an app (re)start, before the first build has finished.
+            # Only after an app (re)start, before the first load has finished.
             with st.spinner("Loading your product gallery..."):
-                snap = get_snapshot()
+                snap = wait_for_first_snapshot()
     except Exception as e:
         st.error(f"Failed to connect / fetch data: {e}")
         return
 
     full_df = snap.df
     filter_options = snap.options
+    st.session_state["_seen_generation"] = snap.generation
 
     if "mobile_filters_open" not in st.session_state:
         st.session_state.mobile_filters_open = False
@@ -2485,6 +2964,9 @@ def main():
             render_summary_bar(filtered, filters["in_stock_only"])
             render_results(filtered, filters["cols_per_row"], snap.uploads_info,
                            filters["in_stock_only"])
+
+    if live_updates is not None:
+        live_updates()
 
     # Time the server spent building this page. If the browser takes much
     # longer than this to show it, the delay is in the browser / network.
